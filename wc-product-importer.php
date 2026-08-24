@@ -1,0 +1,2129 @@
+<?php
+/**
+ * Plugin Name: WooCommerce Product Importer
+ * Plugin URI:  https://example.com/
+ * Description: Imports and updates WooCommerce products from XLSX or CSV files. Includes a full product import mode and a price/inventory update mode.
+ * Version:     1.0.0
+ * Author:      Your Name
+ * License:     GPL-2.0-or-later
+ * Text Domain: wc-product-importer
+ * Requires at least: 6.5
+ * Requires PHP: 7.4
+ * WC requires at least: 8.0
+ * WC tested up to: 11.0
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+final class WC_Single_File_Product_Importer {
+
+	const VERSION            = '1.0.0';
+	const MENU_SLUG          = 'wc-product-importer';
+	const NONCE_ACTION       = 'wc_sfpi_import_products';
+	const NONCE_NAME         = 'wc_sfpi_nonce';
+	const TEMPLATE_ACTION    = 'wc_sfpi_download_template';
+	const TEMPLATE_NONCE     = 'wc_sfpi_download_template_nonce';
+	const MAX_FILE_SIZE      = 20971520; // 20 MB.
+	const MAX_ROWS           = 10000;
+	const CLEAR_TOKEN        = '__CLEAR__';
+
+	/**
+	 * Bootstrap the plugin after all plugins have loaded.
+	 *
+	 * @return void
+	 */
+	public static function init() {
+		if ( ! class_exists( 'WooCommerce' ) ) {
+			add_action( 'admin_notices', array( __CLASS__, 'woocommerce_missing_notice' ) );
+			return;
+		}
+
+		add_action( 'admin_menu', array( __CLASS__, 'register_admin_menu' ), 99 );
+		add_action( 'admin_post_' . self::TEMPLATE_ACTION, array( __CLASS__, 'download_template' ) );
+	}
+
+	/**
+	 * Display the WooCommerce dependency notice.
+	 *
+	 * @return void
+	 */
+	public static function woocommerce_missing_notice() {
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			return;
+		}
+		?>
+		<div class="notice notice-error">
+			<p>
+				<?php
+				echo esc_html__(
+					'WooCommerce Product Importer requires WooCommerce to be installed and active.',
+					'wc-product-importer'
+				);
+				?>
+			</p>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Register "Import Products" under Products.
+	 *
+	 * @return void
+	 */
+	public static function register_admin_menu() {
+		add_submenu_page(
+			'edit.php?post_type=product',
+			__( 'Import Products', 'wc-product-importer' ),
+			__( 'Import Products', 'wc-product-importer' ),
+			'manage_woocommerce',
+			self::MENU_SLUG,
+			array( __CLASS__, 'render_admin_page' )
+		);
+	}
+
+	/**
+	 * Render the importer admin page.
+	 *
+	 * @return void
+	 */
+	public static function render_admin_page() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( esc_html__( 'You do not have permission to import products.', 'wc-product-importer' ) );
+		}
+
+		$result = null;
+
+		if ( 'POST' === strtoupper( isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : '' ) ) {
+			$result = self::process_import_request();
+		}
+
+		$full_template_url = wp_nonce_url(
+			admin_url( 'admin-post.php?action=' . self::TEMPLATE_ACTION . '&mode=full' ),
+			self::TEMPLATE_NONCE
+		);
+
+		$price_stock_template_url = wp_nonce_url(
+			admin_url( 'admin-post.php?action=' . self::TEMPLATE_ACTION . '&mode=price_stock' ),
+			self::TEMPLATE_NONCE
+		);
+		?>
+		<div class="wrap">
+			<h1><?php echo esc_html__( 'Import Products', 'wc-product-importer' ); ?></h1>
+
+			<p>
+				<?php
+				echo esc_html__(
+					'Upload an XLSX or CSV file. SKU is the preferred product identifier and is required when creating a new product.',
+					'wc-product-importer'
+				);
+				?>
+			</p>
+
+			<?php self::render_result( $result ); ?>
+
+			<div style="max-width: 980px; background: #fff; border: 1px solid #dcdcde; padding: 20px; margin-top: 20px;">
+				<form method="post" enctype="multipart/form-data">
+					<?php wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME ); ?>
+
+					<table class="form-table" role="presentation">
+						<tbody>
+							<tr>
+								<th scope="row">
+									<label for="wc-sfpi-mode"><?php echo esc_html__( 'Import mode', 'wc-product-importer' ); ?></label>
+								</th>
+								<td>
+									<select name="import_mode" id="wc-sfpi-mode" required>
+										<option value="full">
+											<?php echo esc_html__( '1. Import products — create/update uploaded product information', 'wc-product-importer' ); ?>
+										</option>
+										<option value="price_stock">
+											<?php echo esc_html__( '2. Update prices and inventory only', 'wc-product-importer' ); ?>
+										</option>
+									</select>
+									<p class="description">
+										<?php
+										echo esc_html__(
+											'Price/inventory mode never creates products; it only updates products already found by ID or SKU.',
+											'wc-product-importer'
+										);
+										?>
+									</p>
+								</td>
+							</tr>
+
+							<tr>
+								<th scope="row">
+									<label for="wc-sfpi-file"><?php echo esc_html__( 'Import file', 'wc-product-importer' ); ?></label>
+								</th>
+								<td>
+									<input
+										type="file"
+										name="import_file"
+										id="wc-sfpi-file"
+										accept=".xlsx,.csv"
+										required
+									/>
+									<p class="description">
+										<?php
+										printf(
+											/* translators: %s: maximum file size. */
+											esc_html__( 'Supported formats: .xlsx and .csv. Maximum plugin limit: %s.', 'wc-product-importer' ),
+											esc_html( size_format( self::MAX_FILE_SIZE ) )
+										);
+										?>
+									</p>
+								</td>
+							</tr>
+						</tbody>
+					</table>
+
+					<?php submit_button( __( 'Import Products', 'wc-product-importer' ) ); ?>
+				</form>
+			</div>
+
+			<div style="max-width: 980px; background: #fff; border: 1px solid #dcdcde; padding: 20px; margin-top: 20px;">
+				<h2><?php echo esc_html__( 'Templates and column format', 'wc-product-importer' ); ?></h2>
+
+				<p>
+					<a class="button" href="<?php echo esc_url( $full_template_url ); ?>">
+						<?php echo esc_html__( 'Download Full Import CSV Template', 'wc-product-importer' ); ?>
+					</a>
+					<a class="button" href="<?php echo esc_url( $price_stock_template_url ); ?>">
+						<?php echo esc_html__( 'Download Price/Stock CSV Template', 'wc-product-importer' ); ?>
+					</a>
+				</p>
+
+				<p>
+					<strong><?php echo esc_html__( 'Important:', 'wc-product-importer' ); ?></strong>
+					<?php
+					printf(
+						/* translators: %s: clear-token value. */
+						esc_html__(
+							'Blank cells do not overwrite existing values. To explicitly clear a supported text/price field, use %s.',
+							'wc-product-importer'
+						),
+						'<code>' . esc_html( self::CLEAR_TOKEN ) . '</code>'
+					);
+					?>
+				</p>
+
+				<ul style="list-style: disc; padding-left: 22px;">
+					<li><code>categories</code>: <code>Clothing &gt; Shirts|Sale</code></li>
+					<li><code>tags</code>: <code>summer|featured</code></li>
+					<li><code>attributes</code>: <code>Color=Red|Blue;Size=S|M|L</code></li>
+					<li><code>variation_attributes</code>: <code>Color=Red;Size=M</code></li>
+					<li><code>default_attributes</code>: <code>Color=Red;Size=M</code></li>
+					<li><code>gallery_images</code>: attachment IDs or image URLs separated by <code>|</code></li>
+					<li><code>downloads</code>: <code>Manual=https://example.com/manual.pdf|Guide=https://example.com/guide.pdf</code></li>
+					<li><code>grouped_products</code>: child product SKUs separated by <code>|</code></li>
+					<li><code>meta:your_key</code>: any non-protected custom metadata key.</li>
+				</ul>
+			</div>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Render import result.
+	 *
+	 * @param array|null $result Import result.
+	 * @return void
+	 */
+	private static function render_result( $result ) {
+		if ( empty( $result ) || ! is_array( $result ) ) {
+			return;
+		}
+
+		$success_count = isset( $result['success'] ) ? (int) $result['success'] : 0;
+		$error_count   = isset( $result['errors'] ) ? count( $result['errors'] ) : 0;
+		$skipped_count = isset( $result['skipped'] ) ? (int) $result['skipped'] : 0;
+		?>
+		<div class="notice <?php echo $error_count > 0 ? 'notice-warning' : 'notice-success'; ?> is-dismissible">
+			<p>
+				<?php
+				printf(
+					/* translators: 1: successful rows, 2: skipped rows, 3: failed rows. */
+					esc_html__( 'Import finished. Successful: %1$d, skipped: %2$d, errors: %3$d.', 'wc-product-importer' ),
+					(int) $success_count,
+					(int) $skipped_count,
+					(int) $error_count
+				);
+				?>
+			</p>
+		</div>
+		<?php
+
+		if ( empty( $result['errors'] ) ) {
+			return;
+		}
+		?>
+		<div style="max-width: 980px; background: #fff; border: 1px solid #dcdcde; padding: 20px; margin-top: 15px;">
+			<h2><?php echo esc_html__( 'Import errors', 'wc-product-importer' ); ?></h2>
+			<table class="widefat striped">
+				<thead>
+					<tr>
+						<th><?php echo esc_html__( 'Row', 'wc-product-importer' ); ?></th>
+						<th><?php echo esc_html__( 'SKU', 'wc-product-importer' ); ?></th>
+						<th><?php echo esc_html__( 'Message', 'wc-product-importer' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $result['errors'] as $error ) : ?>
+						<tr>
+							<td><?php echo esc_html( (string) $error['row'] ); ?></td>
+							<td><?php echo esc_html( (string) $error['sku'] ); ?></td>
+							<td><?php echo esc_html( (string) $error['message'] ); ?></td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Handle the import form.
+	 *
+	 * @return array
+	 */
+	private static function process_import_request() {
+		$result = array(
+			'success' => 0,
+			'skipped' => 0,
+			'errors'  => array(),
+		);
+
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'Permission denied.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		$nonce = isset( $_POST[ self::NONCE_NAME ] ) ? sanitize_text_field( wp_unslash( $_POST[ self::NONCE_NAME ] ) ) : '';
+
+		if ( ! wp_verify_nonce( $nonce, self::NONCE_ACTION ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'Security verification failed. Please refresh the page and try again.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		$mode = isset( $_POST['import_mode'] ) ? sanitize_key( wp_unslash( $_POST['import_mode'] ) ) : '';
+
+		if ( ! in_array( $mode, array( 'full', 'price_stock' ), true ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'Invalid import mode.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		if ( empty( $_FILES['import_file'] ) || ! is_array( $_FILES['import_file'] ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'No import file was uploaded.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		$file = $_FILES['import_file'];
+
+		if ( ! empty( $file['error'] ) ) {
+			$result['errors'][] = self::error_entry(
+				0,
+				'',
+				sprintf(
+					/* translators: %d: PHP upload error code. */
+					__( 'Upload failed with error code %d.', 'wc-product-importer' ),
+					(int) $file['error']
+				)
+			);
+			return $result;
+		}
+
+		$file_size = isset( $file['size'] ) ? (int) $file['size'] : 0;
+
+		if ( $file_size <= 0 || $file_size > self::MAX_FILE_SIZE ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'The uploaded file is empty or exceeds the allowed size.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		$tmp_name = isset( $file['tmp_name'] ) ? (string) $file['tmp_name'] : '';
+		$filename = isset( $file['name'] ) ? sanitize_file_name( wp_unslash( $file['name'] ) ) : '';
+
+		if ( empty( $tmp_name ) || ! is_uploaded_file( $tmp_name ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'The uploaded file could not be verified.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		$extension = strtolower( pathinfo( $filename, PATHINFO_EXTENSION ) );
+
+		if ( ! in_array( $extension, array( 'xlsx', 'csv' ), true ) ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'Only XLSX and CSV files are supported.', 'wc-product-importer' ) );
+			return $result;
+		}
+
+		try {
+			$rows = self::read_import_file( $tmp_name, $extension );
+
+			if ( count( $rows ) < 2 ) {
+				throw new RuntimeException( __( 'The file must contain a header row and at least one data row.', 'wc-product-importer' ) );
+			}
+
+			if ( count( $rows ) - 1 > self::MAX_ROWS ) {
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %d: maximum number of rows. */
+						__( 'The import contains too many rows. The maximum is %d data rows per import.', 'wc-product-importer' ),
+						self::MAX_ROWS
+					)
+				);
+			}
+
+			$headers = self::normalize_headers( array_shift( $rows ) );
+
+			if ( empty( $headers ) ) {
+				throw new RuntimeException( __( 'The header row is empty.', 'wc-product-importer' ) );
+			}
+
+			if ( count( $headers ) !== count( array_unique( $headers ) ) ) {
+				throw new RuntimeException( __( 'The file contains duplicate column names after normalization.', 'wc-product-importer' ) );
+			}
+
+			if ( ! in_array( 'sku', $headers, true ) && ! in_array( 'id', $headers, true ) ) {
+				throw new RuntimeException( __( 'The file must contain an "sku" or "id" column.', 'wc-product-importer' ) );
+			}
+
+			$seen_products = array();
+
+			foreach ( $rows as $index => $row_values ) {
+				$excel_row_number = $index + 2;
+				$row              = self::combine_row( $headers, $row_values );
+
+				if ( self::row_is_empty( $row ) ) {
+					++$result['skipped'];
+					continue;
+				}
+
+				$sku = self::get_string( $row, 'sku' );
+				$id  = self::get_int( $row, 'id' );
+
+				$identity = $id > 0 ? 'id:' . $id : 'sku:' . strtolower( $sku );
+
+				if ( 'sku:' === $identity ) {
+					$result['errors'][] = self::error_entry(
+						$excel_row_number,
+						'',
+						__( 'This row does not contain a valid product ID or SKU.', 'wc-product-importer' )
+					);
+					continue;
+				}
+
+				if ( isset( $seen_products[ $identity ] ) ) {
+					$result['errors'][] = self::error_entry(
+						$excel_row_number,
+						$sku,
+						__( 'Duplicate product identifier in the same import file.', 'wc-product-importer' )
+					);
+					continue;
+				}
+
+				$seen_products[ $identity ] = true;
+
+				try {
+					if ( 'price_stock' === $mode ) {
+						self::import_price_stock_row( $row );
+					} else {
+						self::import_full_row( $row );
+					}
+
+					++$result['success'];
+				} catch ( Throwable $throwable ) {
+					$result['errors'][] = self::error_entry(
+						$excel_row_number,
+						$sku,
+						$throwable->getMessage()
+					);
+				}
+			}
+		} catch ( Throwable $throwable ) {
+			$result['errors'][] = self::error_entry( 0, '', $throwable->getMessage() );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Import one row in price/inventory mode.
+	 *
+	 * @param array $row Row data.
+	 * @return void
+	 * @throws RuntimeException On invalid data.
+	 */
+	private static function import_price_stock_row( array $row ) {
+		$product = self::find_product( $row );
+
+		if ( ! $product ) {
+			throw new RuntimeException( __( 'Product not found. Price/inventory mode does not create new products.', 'wc-product-importer' ) );
+		}
+
+		$changed = false;
+
+		if ( self::has_value_or_clear( $row, 'regular_price' ) ) {
+			$product->set_regular_price( self::decimal_or_clear( $row['regular_price'] ) );
+			$changed = true;
+		}
+
+		if ( self::has_value_or_clear( $row, 'sale_price' ) ) {
+			$product->set_sale_price( self::decimal_or_clear( $row['sale_price'] ) );
+			$changed = true;
+		}
+
+		if ( self::has_value( $row, 'manage_stock' ) ) {
+			$product->set_manage_stock( self::to_bool( $row['manage_stock'] ) );
+			$changed = true;
+		}
+
+		if ( self::has_value( $row, 'stock_quantity' ) ) {
+			$product->set_manage_stock( true );
+			$quantity = self::stock_amount( $row['stock_quantity'] );
+			$product->set_stock_quantity( $quantity );
+
+			if ( ! self::has_value( $row, 'stock_status' ) ) {
+				$product->set_stock_status( $quantity > 0 ? 'instock' : 'outofstock' );
+			}
+
+			$changed = true;
+		}
+
+		if ( self::has_value( $row, 'stock_status' ) ) {
+			$product->set_stock_status( self::validate_stock_status( $row['stock_status'] ) );
+			$changed = true;
+		}
+
+		if ( self::has_value( $row, 'backorders' ) ) {
+			$product->set_backorders( self::validate_backorders( $row['backorders'] ) );
+			$changed = true;
+		}
+
+		if ( ! $changed ) {
+			throw new RuntimeException( __( 'No supported price or inventory values were provided in this row.', 'wc-product-importer' ) );
+		}
+
+		$product->save();
+	}
+
+	/**
+	 * Import one row in full mode.
+	 *
+	 * @param array $row Row data.
+	 * @return void
+	 * @throws RuntimeException On invalid data.
+	 */
+	private static function import_full_row( array $row ) {
+		$product = self::find_product( $row );
+		$is_new  = ! $product;
+		$type    = self::has_value( $row, 'type' ) ? sanitize_key( $row['type'] ) : 'simple';
+
+		if ( $is_new ) {
+			$product = self::create_product_object( $type, $row );
+		} elseif ( self::has_value( $row, 'type' ) && $product->get_type() !== $type ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: 1: existing product type, 2: requested product type. */
+					__( 'Changing an existing product type from "%1$s" to "%2$s" is not supported by this importer. Create a new product or keep the existing type.', 'wc-product-importer' ),
+					$product->get_type(),
+					$type
+				)
+			);
+		}
+
+		if ( $is_new && ! self::has_value( $row, 'sku' ) ) {
+			throw new RuntimeException( __( 'SKU is required when creating a new product.', 'wc-product-importer' ) );
+		}
+
+		if ( $is_new && 'variation' !== $type && ! self::has_value( $row, 'name' ) ) {
+			throw new RuntimeException( __( 'Name is required when creating a new product.', 'wc-product-importer' ) );
+		}
+
+		self::apply_common_fields( $product, $row, $is_new );
+		self::apply_type_specific_fields( $product, $row );
+		self::apply_custom_meta( $product, $row );
+
+		$product_id = $product->save();
+
+		if ( ! $product_id ) {
+			throw new RuntimeException( __( 'WooCommerce could not save the product.', 'wc-product-importer' ) );
+		}
+
+		self::apply_taxonomies( $product, $row );
+		self::apply_images( $product, $row );
+
+		$product->save();
+	}
+
+	/**
+	 * Find a product by ID and/or SKU, validating conflicts.
+	 *
+	 * @param array $row Row data.
+	 * @return WC_Product|false
+	 * @throws RuntimeException On conflicting identifiers.
+	 */
+	private static function find_product( array $row ) {
+		$id  = self::get_int( $row, 'id' );
+		$sku = self::get_string( $row, 'sku' );
+
+		$product_by_id  = $id > 0 ? wc_get_product( $id ) : false;
+		$product_by_sku = false;
+
+		if ( '' !== $sku ) {
+			$sku_id = wc_get_product_id_by_sku( $sku );
+
+			if ( $sku_id ) {
+				$product_by_sku = wc_get_product( $sku_id );
+			}
+		}
+
+		if ( $product_by_id && $product_by_sku && $product_by_id->get_id() !== $product_by_sku->get_id() ) {
+			throw new RuntimeException( __( 'The supplied product ID and SKU point to different products.', 'wc-product-importer' ) );
+		}
+
+		if ( $product_by_id && '' !== $sku && $product_by_id->get_sku() && $product_by_id->get_sku() !== $sku ) {
+			throw new RuntimeException( __( 'The supplied SKU does not match the product found by ID.', 'wc-product-importer' ) );
+		}
+
+		return $product_by_id ? $product_by_id : $product_by_sku;
+	}
+
+	/**
+	 * Create a WooCommerce product object for a new row.
+	 *
+	 * @param string $type Product type.
+	 * @param array  $row  Row data.
+	 * @return WC_Product
+	 * @throws RuntimeException On unsupported types or invalid parent.
+	 */
+	private static function create_product_object( $type, array $row ) {
+		switch ( $type ) {
+			case 'simple':
+				return new WC_Product_Simple();
+
+			case 'variable':
+				return new WC_Product_Variable();
+
+			case 'external':
+				return new WC_Product_External();
+
+			case 'grouped':
+				return new WC_Product_Grouped();
+
+			case 'variation':
+				$parent_sku = self::get_string( $row, 'parent_sku' );
+
+				if ( '' === $parent_sku ) {
+					throw new RuntimeException( __( 'parent_sku is required when creating a variation.', 'wc-product-importer' ) );
+				}
+
+				$variation = new WC_Product_Variation();
+				$variation->set_parent_id( self::resolve_variable_parent_id( $parent_sku ) );
+
+				return $variation;
+
+			default:
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: product type. */
+						__( 'Unsupported product type "%s". Supported types: simple, variable, variation, external, grouped.', 'wc-product-importer' ),
+						$type
+					)
+				);
+		}
+	}
+
+	/**
+	 * Apply shared product fields.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $row     Row data.
+	 * @param bool       $is_new  Whether the product is new.
+	 * @return void
+	 * @throws RuntimeException On invalid values.
+	 */
+	private static function apply_common_fields( WC_Product $product, array $row, $is_new ) {
+		if ( self::has_value( $row, 'sku' ) ) {
+			$sku = wc_clean( $row['sku'] );
+
+			if ( $is_new || $product->get_sku() !== $sku ) {
+				$product->set_sku( $sku );
+			}
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value_or_clear( $row, 'name' ) ) {
+			$product->set_name( self::text_or_clear( $row['name'] ) );
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value_or_clear( $row, 'slug' ) ) {
+			$product->set_slug( sanitize_title( self::text_or_clear( $row['slug'] ) ) );
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value( $row, 'status' ) ) {
+			$product->set_status( self::validate_choice( $row['status'], array( 'draft', 'pending', 'private', 'publish' ), 'status' ) );
+		} elseif ( $is_new && ! $product->is_type( 'variation' ) ) {
+			$product->set_status( 'draft' );
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value( $row, 'catalog_visibility' ) ) {
+			$product->set_catalog_visibility(
+				self::validate_choice(
+					$row['catalog_visibility'],
+					array( 'visible', 'catalog', 'search', 'hidden' ),
+					'catalog_visibility'
+				)
+			);
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value_or_clear( $row, 'description' ) ) {
+			$product->set_description( self::html_or_clear( $row['description'] ) );
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value_or_clear( $row, 'short_description' ) ) {
+			$product->set_short_description( self::html_or_clear( $row['short_description'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'regular_price' ) && method_exists( $product, 'set_regular_price' ) ) {
+			$product->set_regular_price( self::decimal_or_clear( $row['regular_price'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'sale_price' ) && method_exists( $product, 'set_sale_price' ) ) {
+			$product->set_sale_price( self::decimal_or_clear( $row['sale_price'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'sale_start' ) && method_exists( $product, 'set_date_on_sale_from' ) ) {
+			$product->set_date_on_sale_from( self::date_or_clear( $row['sale_start'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'sale_end' ) && method_exists( $product, 'set_date_on_sale_to' ) ) {
+			$product->set_date_on_sale_to( self::date_or_clear( $row['sale_end'] ) );
+		}
+
+		if ( self::has_value( $row, 'tax_status' ) ) {
+			$product->set_tax_status( self::validate_choice( $row['tax_status'], array( 'taxable', 'shipping', 'none' ), 'tax_status' ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'tax_class' ) ) {
+			$product->set_tax_class( sanitize_title( self::text_or_clear( $row['tax_class'] ) ) );
+		}
+
+		if ( self::has_value( $row, 'manage_stock' ) ) {
+			$product->set_manage_stock( self::to_bool( $row['manage_stock'] ) );
+		}
+
+		if ( self::has_value( $row, 'stock_quantity' ) ) {
+			$product->set_manage_stock( true );
+			$quantity = self::stock_amount( $row['stock_quantity'] );
+			$product->set_stock_quantity( $quantity );
+
+			if ( ! self::has_value( $row, 'stock_status' ) ) {
+				$product->set_stock_status( $quantity > 0 ? 'instock' : 'outofstock' );
+			}
+		}
+
+		if ( self::has_value( $row, 'stock_status' ) ) {
+			$product->set_stock_status( self::validate_stock_status( $row['stock_status'] ) );
+		}
+
+		if ( self::has_value( $row, 'backorders' ) ) {
+			$product->set_backorders( self::validate_backorders( $row['backorders'] ) );
+		}
+
+		if ( self::has_value( $row, 'sold_individually' ) ) {
+			$product->set_sold_individually( self::to_bool( $row['sold_individually'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'weight' ) ) {
+			$product->set_weight( self::decimal_or_clear( $row['weight'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'length' ) ) {
+			$product->set_length( self::decimal_or_clear( $row['length'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'width' ) ) {
+			$product->set_width( self::decimal_or_clear( $row['width'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'height' ) ) {
+			$product->set_height( self::decimal_or_clear( $row['height'] ) );
+		}
+
+		if ( self::has_value( $row, 'virtual' ) ) {
+			$product->set_virtual( self::to_bool( $row['virtual'] ) );
+		}
+
+		if ( self::has_value( $row, 'downloadable' ) ) {
+			$product->set_downloadable( self::to_bool( $row['downloadable'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'download_limit' ) ) {
+			$value = self::text_or_clear( $row['download_limit'] );
+			$product->set_download_limit( '' === $value ? -1 : (int) $value );
+		}
+
+		if ( self::has_value_or_clear( $row, 'download_expiry' ) ) {
+			$value = self::text_or_clear( $row['download_expiry'] );
+			$product->set_download_expiry( '' === $value ? -1 : (int) $value );
+		}
+
+		if ( self::has_value_or_clear( $row, 'purchase_note' ) ) {
+			$product->set_purchase_note( self::text_or_clear( $row['purchase_note'] ) );
+		}
+
+		if ( self::has_value( $row, 'menu_order' ) ) {
+			$product->set_menu_order( (int) $row['menu_order'] );
+		}
+
+		if ( self::has_value( $row, 'reviews_allowed' ) ) {
+			$product->set_reviews_allowed( self::to_bool( $row['reviews_allowed'] ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'shipping_class' ) ) {
+			$product->set_shipping_class_id( self::resolve_shipping_class_id( self::text_or_clear( $row['shipping_class'] ) ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'downloads' ) ) {
+			$product->set_downloads( self::parse_downloads( self::text_or_clear( $row['downloads'] ) ) );
+		}
+	}
+
+	/**
+	 * Apply fields specific to variable, variation, external, and grouped products.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $row     Row data.
+	 * @return void
+	 * @throws RuntimeException On invalid values.
+	 */
+	private static function apply_type_specific_fields( WC_Product $product, array $row ) {
+		if ( $product->is_type( 'variable' ) && self::has_value_or_clear( $row, 'attributes' ) ) {
+			$product->set_attributes( self::parse_parent_attributes( self::text_or_clear( $row['attributes'] ), true ) );
+		}
+
+		if ( $product->is_type( 'variable' ) && self::has_value_or_clear( $row, 'default_attributes' ) ) {
+			$product->set_default_attributes( self::parse_variation_attributes( self::text_or_clear( $row['default_attributes'] ) ) );
+		}
+
+		if ( $product->is_type( 'variation' ) ) {
+			if ( self::has_value( $row, 'parent_sku' ) ) {
+				$parent_id = self::resolve_variable_parent_id( self::get_string( $row, 'parent_sku' ) );
+				$product->set_parent_id( $parent_id );
+			}
+
+			$has_attribute_source = false;
+			$attribute_source     = '';
+
+			if ( self::has_value_or_clear( $row, 'variation_attributes' ) ) {
+				$has_attribute_source = true;
+				$attribute_source     = self::text_or_clear( $row['variation_attributes'] );
+			} elseif ( self::has_value_or_clear( $row, 'attributes' ) ) {
+				$has_attribute_source = true;
+				$attribute_source     = self::text_or_clear( $row['attributes'] );
+			}
+
+			if ( $has_attribute_source ) {
+				$product->set_attributes( self::parse_variation_attributes( $attribute_source ) );
+			}
+		} elseif ( self::has_value_or_clear( $row, 'attributes' ) && ! $product->is_type( 'variable' ) ) {
+			$product->set_attributes( self::parse_parent_attributes( self::text_or_clear( $row['attributes'] ), false ) );
+		}
+
+		if ( $product->is_type( 'external' ) ) {
+			if ( self::has_value_or_clear( $row, 'external_url' ) ) {
+				$product->set_product_url( esc_url_raw( self::text_or_clear( $row['external_url'] ) ) );
+			}
+
+			if ( self::has_value_or_clear( $row, 'button_text' ) ) {
+				$product->set_button_text( self::text_or_clear( $row['button_text'] ) );
+			}
+		}
+
+		if ( $product->is_type( 'grouped' ) && self::has_value_or_clear( $row, 'grouped_products' ) ) {
+			$product->set_children( self::resolve_product_skus( self::text_or_clear( $row['grouped_products'] ) ) );
+		}
+	}
+
+	/**
+	 * Apply product categories and tags.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $row     Row data.
+	 * @return void
+	 * @throws RuntimeException On taxonomy errors.
+	 */
+	private static function apply_taxonomies( WC_Product $product, array $row ) {
+		if ( $product->is_type( 'variation' ) ) {
+			return;
+		}
+
+		if ( self::has_value_or_clear( $row, 'categories' ) ) {
+			$value = self::text_or_clear( $row['categories'] );
+			$product->set_category_ids( '' === $value ? array() : self::resolve_categories( $value ) );
+		}
+
+		if ( self::has_value_or_clear( $row, 'tags' ) ) {
+			$value = self::text_or_clear( $row['tags'] );
+			$product->set_tag_ids( '' === $value ? array() : self::resolve_tags( $value ) );
+		}
+	}
+
+	/**
+	 * Apply featured and gallery images.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $row     Row data.
+	 * @return void
+	 * @throws RuntimeException On image import failure.
+	 */
+	private static function apply_images( WC_Product $product, array $row ) {
+		$product_id = $product->get_id();
+
+		if ( ! $product_id ) {
+			return;
+		}
+
+		if ( self::has_value_or_clear( $row, 'featured_image' ) ) {
+			$value = self::text_or_clear( $row['featured_image'] );
+			$product->set_image_id( '' === $value ? 0 : self::resolve_image_id( $value, $product_id ) );
+		}
+
+		if ( ! $product->is_type( 'variation' ) && self::has_value_or_clear( $row, 'gallery_images' ) ) {
+			$value = self::text_or_clear( $row['gallery_images'] );
+
+			if ( '' === $value ) {
+				$product->set_gallery_image_ids( array() );
+			} else {
+				$ids = array();
+
+				foreach ( self::split_pipe( $value ) as $image ) {
+					$ids[] = self::resolve_image_id( $image, $product_id );
+				}
+
+				$product->set_gallery_image_ids( array_values( array_unique( array_filter( $ids ) ) ) );
+			}
+		}
+	}
+
+	/**
+	 * Import custom metadata from columns named meta:key.
+	 *
+	 * Protected metadata beginning with "_" is intentionally rejected.
+	 *
+	 * @param WC_Product $product Product.
+	 * @param array      $row     Row data.
+	 * @return void
+	 */
+	private static function apply_custom_meta( WC_Product $product, array $row ) {
+		foreach ( $row as $column => $value ) {
+			if ( 0 !== strpos( $column, 'meta:' ) || ! self::has_value_or_clear( $row, $column ) ) {
+				continue;
+			}
+
+			$key = sanitize_key( substr( $column, 5 ) );
+
+			if ( '' === $key || 0 === strpos( $key, '_' ) ) {
+				continue;
+			}
+
+			if ( self::is_clear( $value ) ) {
+				$product->delete_meta_data( $key );
+			} else {
+				$product->update_meta_data( $key, sanitize_text_field( (string) $value ) );
+			}
+		}
+	}
+
+	/**
+	 * Resolve a shipping class by slug or name, creating it if necessary.
+	 *
+	 * @param string $value Shipping class.
+	 * @return int
+	 * @throws RuntimeException On term creation error.
+	 */
+	private static function resolve_shipping_class_id( $value ) {
+		if ( '' === $value ) {
+			return 0;
+		}
+
+		$term = get_term_by( 'slug', sanitize_title( $value ), 'product_shipping_class' );
+
+		if ( ! $term ) {
+			$term = get_term_by( 'name', $value, 'product_shipping_class' );
+		}
+
+		if ( $term ) {
+			return (int) $term->term_id;
+		}
+
+		$created = wp_insert_term(
+			$value,
+			'product_shipping_class',
+			array(
+				'slug' => sanitize_title( $value ),
+			)
+		);
+
+		if ( is_wp_error( $created ) ) {
+			throw new RuntimeException( $created->get_error_message() );
+		}
+
+		return (int) $created['term_id'];
+	}
+
+	/**
+	 * Resolve or create hierarchical product categories.
+	 *
+	 * @param string $value Category paths separated by "|".
+	 * @return array
+	 * @throws RuntimeException On taxonomy errors.
+	 */
+	private static function resolve_categories( $value ) {
+		$ids = array();
+
+		foreach ( self::split_pipe( $value ) as $category_path ) {
+			$segments  = array_filter( array_map( 'trim', explode( '>', $category_path ) ), 'strlen' );
+			$parent_id = 0;
+
+			foreach ( $segments as $segment ) {
+				$existing = term_exists( $segment, 'product_cat', $parent_id );
+
+				if ( $existing ) {
+					$term_id = is_array( $existing ) ? (int) $existing['term_id'] : (int) $existing;
+				} else {
+					$created = wp_insert_term(
+						$segment,
+						'product_cat',
+						array(
+							'parent' => $parent_id,
+						)
+					);
+
+					if ( is_wp_error( $created ) ) {
+						throw new RuntimeException( $created->get_error_message() );
+					}
+
+					$term_id = (int) $created['term_id'];
+				}
+
+				$parent_id = $term_id;
+			}
+
+			if ( $parent_id ) {
+				$ids[] = $parent_id;
+			}
+		}
+
+		return array_values( array_unique( $ids ) );
+	}
+
+	/**
+	 * Resolve or create product tags.
+	 *
+	 * @param string $value Tag names separated by "|".
+	 * @return array
+	 * @throws RuntimeException On taxonomy errors.
+	 */
+	private static function resolve_tags( $value ) {
+		$ids = array();
+
+		foreach ( self::split_pipe( $value ) as $tag ) {
+			$existing = term_exists( $tag, 'product_tag' );
+
+			if ( $existing ) {
+				$ids[] = is_array( $existing ) ? (int) $existing['term_id'] : (int) $existing;
+				continue;
+			}
+
+			$created = wp_insert_term( $tag, 'product_tag' );
+
+			if ( is_wp_error( $created ) ) {
+				throw new RuntimeException( $created->get_error_message() );
+			}
+
+			$ids[] = (int) $created['term_id'];
+		}
+
+		return array_values( array_unique( $ids ) );
+	}
+
+	/**
+	 * Parse custom product attributes.
+	 *
+	 * Format: Color=Red|Blue;Size=S|M|L
+	 *
+	 * @param string $value        Raw value.
+	 * @param bool   $for_variation Whether attributes should be variation attributes.
+	 * @return array
+	 */
+	private static function parse_parent_attributes( $value, $for_variation ) {
+		if ( '' === $value ) {
+			return array();
+		}
+
+		$attributes = array();
+		$position   = 0;
+
+		foreach ( array_filter( array_map( 'trim', explode( ';', $value ) ), 'strlen' ) as $definition ) {
+			$parts = explode( '=', $definition, 2 );
+
+			if ( 2 !== count( $parts ) ) {
+				continue;
+			}
+
+			$name    = sanitize_text_field( trim( $parts[0] ) );
+			$options = array_map( 'sanitize_text_field', self::split_pipe( $parts[1] ) );
+
+			if ( '' === $name || empty( $options ) ) {
+				continue;
+			}
+
+			$attribute = new WC_Product_Attribute();
+			$attribute->set_id( 0 );
+			$attribute->set_name( $name );
+			$attribute->set_options( array_values( array_unique( $options ) ) );
+			$attribute->set_position( $position );
+			$attribute->set_visible( true );
+			$attribute->set_variation( (bool) $for_variation );
+
+			$attributes[] = $attribute;
+			++$position;
+		}
+
+		return $attributes;
+	}
+
+	/**
+	 * Parse variation/default attributes.
+	 *
+	 * Format: Color=Red;Size=M
+	 *
+	 * @param string $value Raw value.
+	 * @return array
+	 */
+	private static function parse_variation_attributes( $value ) {
+		$attributes = array();
+
+		if ( '' === $value ) {
+			return $attributes;
+		}
+
+		foreach ( array_filter( array_map( 'trim', explode( ';', $value ) ), 'strlen' ) as $definition ) {
+			$parts = explode( '=', $definition, 2 );
+
+			if ( 2 !== count( $parts ) ) {
+				continue;
+			}
+
+			$name  = sanitize_title( trim( $parts[0] ) );
+			$term  = sanitize_text_field( trim( $parts[1] ) );
+
+			if ( '' !== $name ) {
+				$attributes[ $name ] = $term;
+			}
+		}
+
+		return $attributes;
+	}
+
+	/**
+	 * Resolve a variable parent product by SKU.
+	 *
+	 * @param string $parent_sku Parent SKU.
+	 * @return int
+	 * @throws RuntimeException If the parent cannot be resolved.
+	 */
+	private static function resolve_variable_parent_id( $parent_sku ) {
+		$parent_id = wc_get_product_id_by_sku( $parent_sku );
+		$parent    = $parent_id ? wc_get_product( $parent_id ) : false;
+
+		if ( ! $parent || ! $parent->is_type( 'variable' ) ) {
+			throw new RuntimeException( __( 'The variation parent could not be found or is not a variable product.', 'wc-product-importer' ) );
+		}
+
+		return (int) $parent_id;
+	}
+
+	/**
+	 * Resolve a list of product SKUs to IDs.
+	 *
+	 * @param string $value SKU list.
+	 * @return array
+	 * @throws RuntimeException If a child SKU does not exist.
+	 */
+	private static function resolve_product_skus( $value ) {
+		if ( '' === $value ) {
+			return array();
+		}
+
+		$ids = array();
+
+		foreach ( self::split_pipe( $value ) as $sku ) {
+			$id = wc_get_product_id_by_sku( $sku );
+
+			if ( ! $id ) {
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: SKU. */
+						__( 'Referenced product SKU "%s" could not be found.', 'wc-product-importer' ),
+						$sku
+					)
+				);
+			}
+
+			$ids[] = $id;
+		}
+
+		return array_values( array_unique( $ids ) );
+	}
+
+	/**
+	 * Parse downloadable files.
+	 *
+	 * Format: Name=https://example.com/file.pdf|Second=https://example.com/file2.zip
+	 *
+	 * @param string $value Raw download definitions.
+	 * @return array
+	 */
+	private static function parse_downloads( $value ) {
+		$downloads = array();
+
+		if ( '' === $value ) {
+			return $downloads;
+		}
+
+		foreach ( self::split_pipe( $value ) as $definition ) {
+			$parts = explode( '=', $definition, 2 );
+
+			if ( 2 !== count( $parts ) ) {
+				continue;
+			}
+
+			$name = sanitize_text_field( trim( $parts[0] ) );
+			$url  = esc_url_raw( trim( $parts[1] ) );
+
+			if ( '' === $name || '' === $url ) {
+				continue;
+			}
+
+			$download = new WC_Product_Download();
+			$download->set_id( md5( $url ) );
+			$download->set_name( $name );
+			$download->set_file( $url );
+
+			$downloads[ $download->get_id() ] = $download;
+		}
+
+		return $downloads;
+	}
+
+	/**
+	 * Resolve an attachment ID or sideload a remote image URL.
+	 *
+	 * @param string $value      Attachment ID or URL.
+	 * @param int    $product_id Product ID.
+	 * @return int
+	 * @throws RuntimeException On invalid image.
+	 */
+	private static function resolve_image_id( $value, $product_id ) {
+		$value = trim( $value );
+
+		if ( ctype_digit( $value ) ) {
+			$attachment_id = (int) $value;
+
+			if ( wp_attachment_is_image( $attachment_id ) ) {
+				return $attachment_id;
+			}
+
+			throw new RuntimeException( __( 'An image attachment ID in the file is invalid.', 'wc-product-importer' ) );
+		}
+
+		$url = esc_url_raw( $value );
+
+		if ( '' === $url || ! wp_http_validate_url( $url ) ) {
+			throw new RuntimeException( __( 'An image URL in the file is invalid.', 'wc-product-importer' ) );
+		}
+
+		$existing_id = attachment_url_to_postid( $url );
+
+		if ( $existing_id && wp_attachment_is_image( $existing_id ) ) {
+			return (int) $existing_id;
+		}
+
+		$existing = get_posts(
+			array(
+				'post_type'      => 'attachment',
+				'post_status'    => 'inherit',
+				'fields'         => 'ids',
+				'posts_per_page' => 1,
+				'meta_key'       => '_wc_sfpi_source_url',
+				'meta_value'     => $url,
+				'no_found_rows'  => true,
+			)
+		);
+
+		if ( ! empty( $existing[0] ) && wp_attachment_is_image( $existing[0] ) ) {
+			return (int) $existing[0];
+		}
+
+		require_once ABSPATH . 'wp-admin/includes/file.php';
+		require_once ABSPATH . 'wp-admin/includes/media.php';
+		require_once ABSPATH . 'wp-admin/includes/image.php';
+
+		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
+
+		if ( is_wp_error( $attachment_id ) ) {
+			throw new RuntimeException( $attachment_id->get_error_message() );
+		}
+
+		update_post_meta( $attachment_id, '_wc_sfpi_source_url', $url );
+
+		return (int) $attachment_id;
+	}
+
+	/**
+	 * Read XLSX or CSV into a matrix.
+	 *
+	 * @param string $path      Temporary upload path.
+	 * @param string $extension File extension.
+	 * @return array
+	 * @throws RuntimeException On invalid file.
+	 */
+	private static function read_import_file( $path, $extension ) {
+		if ( 'csv' === $extension ) {
+			return self::read_csv( $path );
+		}
+
+		return self::read_xlsx( $path );
+	}
+
+	/**
+	 * Read a CSV file.
+	 *
+	 * @param string $path File path.
+	 * @return array
+	 * @throws RuntimeException On unreadable file.
+	 */
+	private static function read_csv( $path ) {
+		$handle = fopen( $path, 'rb' );
+
+		if ( false === $handle ) {
+			throw new RuntimeException( __( 'The CSV file could not be opened.', 'wc-product-importer' ) );
+		}
+
+		$first_line = fgets( $handle );
+
+		if ( false === $first_line ) {
+			fclose( $handle );
+			throw new RuntimeException( __( 'The CSV file is empty.', 'wc-product-importer' ) );
+		}
+
+		$delimiter = self::detect_csv_delimiter( $first_line );
+		rewind( $handle );
+
+		$rows = array();
+
+		while ( false !== ( $row = fgetcsv( $handle, 0, $delimiter, '"', '' ) ) ) {
+			if ( ! empty( $row[0] ) && 0 === strpos( $row[0], "\xEF\xBB\xBF" ) ) {
+				$row[0] = substr( $row[0], 3 );
+			}
+
+			$rows[] = array_map(
+				static function ( $value ) {
+					return is_string( $value ) ? trim( $value ) : $value;
+				},
+				$row
+			);
+
+			if ( count( $rows ) > self::MAX_ROWS + 1 ) {
+				break;
+			}
+		}
+
+		fclose( $handle );
+
+		return $rows;
+	}
+
+	/**
+	 * Detect common CSV delimiters.
+	 *
+	 * @param string $line First CSV line.
+	 * @return string
+	 */
+	private static function detect_csv_delimiter( $line ) {
+		$delimiters = array(
+			','  => substr_count( $line, ',' ),
+			';'  => substr_count( $line, ';' ),
+			"\t" => substr_count( $line, "\t" ),
+		);
+
+		arsort( $delimiters );
+
+		$delimiter = key( $delimiters );
+
+		return $delimiters[ $delimiter ] > 0 ? $delimiter : ',';
+	}
+
+	/**
+	 * Read the first worksheet from an XLSX file.
+	 *
+	 * Uses ZipArchive + SimpleXML to avoid any external PHP library.
+	 *
+	 * @param string $path File path.
+	 * @return array
+	 * @throws RuntimeException On malformed/unsupported XLSX.
+	 */
+	private static function read_xlsx( $path ) {
+		if ( ! class_exists( 'ZipArchive' ) ) {
+			throw new RuntimeException( __( 'The PHP ZipArchive extension is required to read XLSX files.', 'wc-product-importer' ) );
+		}
+
+		if ( ! function_exists( 'simplexml_load_string' ) ) {
+			throw new RuntimeException( __( 'The PHP SimpleXML extension is required to read XLSX files.', 'wc-product-importer' ) );
+		}
+
+		$zip = new ZipArchive();
+
+		if ( true !== $zip->open( $path ) ) {
+			throw new RuntimeException( __( 'The XLSX file is not a valid ZIP-based Excel workbook.', 'wc-product-importer' ) );
+		}
+
+		try {
+			if ( false === $zip->locateName( '[Content_Types].xml' ) || false === $zip->locateName( 'xl/workbook.xml' ) ) {
+				throw new RuntimeException( __( 'The uploaded XLSX file is missing required workbook data.', 'wc-product-importer' ) );
+			}
+
+			$shared_strings = self::xlsx_shared_strings( $zip );
+			$sheet_path     = self::xlsx_first_sheet_path( $zip );
+			$sheet_xml      = $zip->getFromName( $sheet_path );
+
+			if ( false === $sheet_xml ) {
+				throw new RuntimeException( __( 'The first Excel worksheet could not be read.', 'wc-product-importer' ) );
+			}
+
+			$xml = self::safe_simplexml( $sheet_xml );
+
+			if ( ! $xml ) {
+				throw new RuntimeException( __( 'The first Excel worksheet contains invalid XML.', 'wc-product-importer' ) );
+			}
+
+			$xml->registerXPathNamespace( 'main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+			$row_nodes = $xml->xpath( '//main:sheetData/main:row' );
+			$rows      = array();
+
+			if ( empty( $row_nodes ) ) {
+				return $rows;
+			}
+
+			foreach ( $row_nodes as $row_node ) {
+				$row          = array();
+				$row_children = $row_node->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+				foreach ( $row_children->c as $cell ) {
+					$attributes   = $cell->attributes();
+					$reference    = isset( $attributes['r'] ) ? (string) $attributes['r'] : '';
+					$column_index = self::xlsx_column_index( $reference );
+					$type         = isset( $attributes['t'] ) ? (string) $attributes['t'] : 'n';
+					$value        = '';
+
+					$cell_children = $cell->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+					if ( 'inlineStr' === $type ) {
+						$value = self::xlsx_inline_string( $cell );
+					} elseif ( isset( $cell_children->v ) ) {
+						$raw = (string) $cell_children->v;
+
+						if ( 's' === $type ) {
+							$shared_index = (int) $raw;
+							$value        = isset( $shared_strings[ $shared_index ] ) ? $shared_strings[ $shared_index ] : '';
+						} elseif ( 'b' === $type ) {
+							$value = '1' === $raw ? '1' : '0';
+						} else {
+							$value = $raw;
+						}
+					}
+
+					$row[ $column_index ] = trim( (string) $value );
+				}
+
+				if ( empty( $row ) ) {
+					$rows[] = array();
+				} else {
+					$max_index  = max( array_keys( $row ) );
+					$normalized = array();
+
+					for ( $i = 0; $i <= $max_index; $i++ ) {
+						$normalized[] = isset( $row[ $i ] ) ? $row[ $i ] : '';
+					}
+
+					$rows[] = $normalized;
+				}
+
+				if ( count( $rows ) > self::MAX_ROWS + 1 ) {
+					break;
+				}
+			}
+
+			return $rows;
+		} finally {
+			$zip->close();
+		}
+	}
+
+	/**
+	 * Load XLSX shared strings.
+	 *
+	 * @param ZipArchive $zip XLSX archive.
+	 * @return array
+	 */
+	private static function xlsx_shared_strings( ZipArchive $zip ) {
+		$xml_string = $zip->getFromName( 'xl/sharedStrings.xml' );
+
+		if ( false === $xml_string ) {
+			return array();
+		}
+
+		$xml = self::safe_simplexml( $xml_string );
+
+		if ( ! $xml ) {
+			return array();
+		}
+
+		$strings  = array();
+		$children = $xml->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+		foreach ( $children->si as $item ) {
+			$text          = '';
+			$item_children = $item->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+			if ( isset( $item_children->t ) ) {
+				$text = (string) $item_children->t;
+			} elseif ( isset( $item_children->r ) ) {
+				foreach ( $item_children->r as $run ) {
+					$run_children = $run->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+					$text        .= isset( $run_children->t ) ? (string) $run_children->t : '';
+				}
+			}
+
+			$strings[] = $text;
+		}
+
+		return $strings;
+	}
+
+	/**
+	 * Get the first worksheet path from workbook relationships.
+	 *
+	 * @param ZipArchive $zip XLSX archive.
+	 * @return string
+	 * @throws RuntimeException On malformed workbook.
+	 */
+	private static function xlsx_first_sheet_path( ZipArchive $zip ) {
+		$workbook_xml = $zip->getFromName( 'xl/workbook.xml' );
+		$rels_xml     = $zip->getFromName( 'xl/_rels/workbook.xml.rels' );
+
+		if ( false === $workbook_xml || false === $rels_xml ) {
+			return 'xl/worksheets/sheet1.xml';
+		}
+
+		$workbook = self::safe_simplexml( $workbook_xml );
+		$rels     = self::safe_simplexml( $rels_xml );
+
+		if ( ! $workbook || ! $rels ) {
+			return 'xl/worksheets/sheet1.xml';
+		}
+
+		$workbook->registerXPathNamespace( 'main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+		$workbook->registerXPathNamespace( 'r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships' );
+
+		$sheets = $workbook->xpath( '//main:sheets/main:sheet' );
+
+		if ( empty( $sheets[0] ) ) {
+			return 'xl/worksheets/sheet1.xml';
+		}
+
+		$sheet_attributes = $sheets[0]->attributes( 'http://schemas.openxmlformats.org/officeDocument/2006/relationships' );
+		$relationship_id  = isset( $sheet_attributes['id'] ) ? (string) $sheet_attributes['id'] : '';
+
+		if ( '' === $relationship_id ) {
+			return 'xl/worksheets/sheet1.xml';
+		}
+
+		$relationship_children = $rels->children( 'http://schemas.openxmlformats.org/package/2006/relationships' );
+
+		foreach ( $relationship_children->Relationship as $relationship ) {
+			$attributes = $relationship->attributes();
+
+			if ( isset( $attributes['Id'], $attributes['Target'] ) && (string) $attributes['Id'] === $relationship_id ) {
+				$target = (string) $attributes['Target'];
+				$target = ltrim( $target, '/' );
+
+				if ( 0 === strpos( $target, 'xl/' ) ) {
+					return $target;
+				}
+
+				return 'xl/' . $target;
+			}
+		}
+
+		return 'xl/worksheets/sheet1.xml';
+	}
+
+	/**
+	 * Safely load XML with external network access disabled.
+	 *
+	 * @param string $xml XML data.
+	 * @return SimpleXMLElement|false
+	 */
+	private static function safe_simplexml( $xml ) {
+		$previous = libxml_use_internal_errors( true );
+		$object   = simplexml_load_string( $xml, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA );
+		libxml_clear_errors();
+		libxml_use_internal_errors( $previous );
+
+		return $object;
+	}
+
+	/**
+	 * Read an inline XLSX string.
+	 *
+	 * @param SimpleXMLElement $cell Cell.
+	 * @return string
+	 */
+	private static function xlsx_inline_string( $cell ) {
+		$children = $cell->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+		if ( ! isset( $children->is ) ) {
+			return '';
+		}
+
+		$inline_children = $children->is->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+
+		if ( isset( $inline_children->t ) ) {
+			return (string) $inline_children->t;
+		}
+
+		$text = '';
+
+		if ( isset( $inline_children->r ) ) {
+			foreach ( $inline_children->r as $run ) {
+				$run_children = $run->children( 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
+				$text        .= isset( $run_children->t ) ? (string) $run_children->t : '';
+			}
+		}
+
+		return $text;
+	}
+
+	/**
+	 * Convert an Excel cell reference to a zero-based column index.
+	 *
+	 * Example: A1 => 0, B1 => 1, AA1 => 26.
+	 *
+	 * @param string $reference Cell reference.
+	 * @return int
+	 */
+	private static function xlsx_column_index( $reference ) {
+		if ( ! preg_match( '/^([A-Z]+)/i', $reference, $matches ) ) {
+			return 0;
+		}
+
+		$letters = strtoupper( $matches[1] );
+		$index   = 0;
+		$length  = strlen( $letters );
+
+		for ( $i = 0; $i < $length; $i++ ) {
+			$index = ( $index * 26 ) + ( ord( $letters[ $i ] ) - 64 );
+		}
+
+		return $index - 1;
+	}
+
+	/**
+	 * Normalize spreadsheet headers to canonical field names.
+	 *
+	 * @param array $headers Raw headers.
+	 * @return array
+	 */
+	private static function normalize_headers( array $headers ) {
+		$aliases = array(
+			'product_id'        => 'id',
+			'product_sku'       => 'sku',
+			'product_type'      => 'type',
+			'title'             => 'name',
+			'product_name'      => 'name',
+			'price'             => 'regular_price',
+			'regularprice'      => 'regular_price',
+			'saleprice'         => 'sale_price',
+			'stock'             => 'stock_quantity',
+			'quantity'          => 'stock_quantity',
+			'qty'               => 'stock_quantity',
+			'inventory'         => 'stock_quantity',
+			'manage_inventory'  => 'manage_stock',
+			'featured_image_url'=> 'featured_image',
+			'image'             => 'featured_image',
+			'gallery'           => 'gallery_images',
+			'parent'            => 'parent_sku',
+			'product_url'       => 'external_url',
+		);
+
+		$normalized = array();
+
+		foreach ( $headers as $header ) {
+			$header = trim( (string) $header );
+
+			if ( 0 === strpos( strtolower( $header ), 'meta:' ) ) {
+				$key          = sanitize_key( substr( $header, 5 ) );
+				$normalized[] = 'meta:' . $key;
+				continue;
+			}
+
+			$header = strtolower( $header );
+			$header = preg_replace( '/[\s\-]+/', '_', $header );
+			$header = preg_replace( '/[^a-z0-9_]/', '', $header );
+			$header = trim( $header, '_' );
+
+			$normalized[] = isset( $aliases[ $header ] ) ? $aliases[ $header ] : $header;
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Combine headers and row values safely.
+	 *
+	 * @param array $headers Header names.
+	 * @param array $values  Row values.
+	 * @return array
+	 */
+	private static function combine_row( array $headers, array $values ) {
+		$row = array();
+
+		foreach ( $headers as $index => $header ) {
+			if ( '' === $header ) {
+				continue;
+			}
+
+			$row[ $header ] = isset( $values[ $index ] ) ? trim( (string) $values[ $index ] ) : '';
+		}
+
+		return $row;
+	}
+
+	/**
+	 * Determine whether an associative row is empty.
+	 *
+	 * @param array $row Row.
+	 * @return bool
+	 */
+	private static function row_is_empty( array $row ) {
+		foreach ( $row as $value ) {
+			if ( '' !== trim( (string) $value ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Check if a column exists and is non-blank.
+	 *
+	 * @param array  $row Row.
+	 * @param string $key Key.
+	 * @return bool
+	 */
+	private static function has_value( array $row, $key ) {
+		return array_key_exists( $key, $row ) && '' !== trim( (string) $row[ $key ] );
+	}
+
+	/**
+	 * Check if a column has a value or explicit clear token.
+	 *
+	 * @param array  $row Row.
+	 * @param string $key Key.
+	 * @return bool
+	 */
+	private static function has_value_or_clear( array $row, $key ) {
+		return self::has_value( $row, $key );
+	}
+
+	/**
+	 * Check clear token.
+	 *
+	 * @param mixed $value Value.
+	 * @return bool
+	 */
+	private static function is_clear( $value ) {
+		return self::CLEAR_TOKEN === strtoupper( trim( (string) $value ) );
+	}
+
+	/**
+	 * Get sanitized string from row.
+	 *
+	 * @param array  $row Row.
+	 * @param string $key Key.
+	 * @return string
+	 */
+	private static function get_string( array $row, $key ) {
+		return self::has_value( $row, $key ) ? wc_clean( $row[ $key ] ) : '';
+	}
+
+	/**
+	 * Get integer from row.
+	 *
+	 * @param array  $row Row.
+	 * @param string $key Key.
+	 * @return int
+	 */
+	private static function get_int( array $row, $key ) {
+		return self::has_value( $row, $key ) ? absint( $row[ $key ] ) : 0;
+	}
+
+	/**
+	 * Sanitize text or return empty for clear token.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 */
+	private static function text_or_clear( $value ) {
+		return self::is_clear( $value ) ? '' : sanitize_text_field( (string) $value );
+	}
+
+	/**
+	 * Sanitize rich text or return empty for clear token.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 */
+	private static function html_or_clear( $value ) {
+		return self::is_clear( $value ) ? '' : wp_kses_post( (string) $value );
+	}
+
+	/**
+	 * Format decimal or return empty for clear token.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 * @throws RuntimeException On invalid decimal.
+	 */
+	private static function decimal_or_clear( $value ) {
+		if ( self::is_clear( $value ) ) {
+			return '';
+		}
+
+		$normalized = wc_format_decimal( trim( (string) $value ) );
+
+		if ( '' === $normalized || ! is_numeric( $normalized ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: invalid numeric value. */
+					__( '"%s" is not a valid numeric value.', 'wc-product-importer' ),
+					$value
+				)
+			);
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Parse a stock quantity safely.
+	 *
+	 * @param mixed $value Raw stock value.
+	 * @return int|float
+	 * @throws RuntimeException On invalid stock quantity.
+	 */
+	private static function stock_amount( $value ) {
+		$normalized = wc_format_decimal( trim( (string) $value ) );
+
+		if ( '' === $normalized || ! is_numeric( $normalized ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: invalid stock value. */
+					__( '"%s" is not a valid stock quantity.', 'wc-product-importer' ),
+					$value
+				)
+			);
+		}
+
+		return wc_stock_amount( $normalized );
+	}
+
+	/**
+	 * Parse date for WooCommerce or clear it.
+	 *
+	 * @param mixed $value Date value.
+	 * @return WC_DateTime|null
+	 * @throws RuntimeException On invalid date.
+	 */
+	private static function date_or_clear( $value ) {
+		if ( self::is_clear( $value ) ) {
+			return null;
+		}
+
+		try {
+			return wc_string_to_datetime( trim( (string) $value ) );
+		} catch ( Exception $exception ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: invalid date. */
+					__( '"%s" is not a valid date. Use a format such as YYYY-MM-DD or YYYY-MM-DD HH:MM:SS.', 'wc-product-importer' ),
+					$value
+				)
+			);
+		}
+	}
+
+	/**
+	 * Parse a boolean value.
+	 *
+	 * @param mixed $value Raw value.
+	 * @return bool
+	 * @throws RuntimeException On invalid boolean.
+	 */
+	private static function to_bool( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+
+		if ( in_array( $value, array( '1', 'true', 'yes', 'y', 'on' ), true ) ) {
+			return true;
+		}
+
+		if ( in_array( $value, array( '0', 'false', 'no', 'n', 'off' ), true ) ) {
+			return false;
+		}
+
+		throw new RuntimeException(
+			sprintf(
+				/* translators: %s: invalid boolean value. */
+				__( '"%s" is not a valid boolean value. Use yes/no, true/false, or 1/0.', 'wc-product-importer' ),
+				$value
+			)
+		);
+	}
+
+	/**
+	 * Validate an allowed choice.
+	 *
+	 * @param mixed  $value   Raw value.
+	 * @param array  $allowed Allowed values.
+	 * @param string $field   Field name.
+	 * @return string
+	 * @throws RuntimeException On invalid choice.
+	 */
+	private static function validate_choice( $value, array $allowed, $field ) {
+		$value = sanitize_key( $value );
+
+		if ( ! in_array( $value, $allowed, true ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: 1: field name, 2: allowed values. */
+					__( 'Invalid %1$s. Allowed values: %2$s.', 'wc-product-importer' ),
+					$field,
+					implode( ', ', $allowed )
+				)
+			);
+		}
+
+		return $value;
+	}
+
+	/**
+	 * Validate a stock status.
+	 *
+	 * @param mixed $value Raw stock status.
+	 * @return string
+	 */
+	private static function validate_stock_status( $value ) {
+		return self::validate_choice( $value, array( 'instock', 'outofstock', 'onbackorder' ), 'stock_status' );
+	}
+
+	/**
+	 * Validate backorders.
+	 *
+	 * @param mixed $value Raw backorder value.
+	 * @return string
+	 */
+	private static function validate_backorders( $value ) {
+		return self::validate_choice( $value, array( 'no', 'notify', 'yes' ), 'backorders' );
+	}
+
+	/**
+	 * Split a pipe-separated value.
+	 *
+	 * @param string $value Raw value.
+	 * @return array
+	 */
+	private static function split_pipe( $value ) {
+		return array_values( array_filter( array_map( 'trim', explode( '|', $value ) ), 'strlen' ) );
+	}
+
+	/**
+	 * Create one error result entry.
+	 *
+	 * @param int    $row     Row number.
+	 * @param string $sku     SKU.
+	 * @param string $message Error message.
+	 * @return array
+	 */
+	private static function error_entry( $row, $sku, $message ) {
+		return array(
+			'row'     => (int) $row,
+			'sku'     => (string) $sku,
+			'message' => wp_strip_all_tags( (string) $message ),
+		);
+	}
+
+	/**
+	 * Download CSV templates without any extra plugin files.
+	 *
+	 * @return void
+	 */
+	public static function download_template() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( esc_html__( 'You do not have permission to download this template.', 'wc-product-importer' ) );
+		}
+
+		check_admin_referer( self::TEMPLATE_NONCE );
+
+		$mode = isset( $_GET['mode'] ) ? sanitize_key( wp_unslash( $_GET['mode'] ) ) : 'full';
+
+		if ( 'price_stock' === $mode ) {
+			$filename = 'woocommerce-price-stock-import-template.csv';
+			$headers  = array(
+				'id',
+				'sku',
+				'regular_price',
+				'sale_price',
+				'manage_stock',
+				'stock_quantity',
+				'stock_status',
+				'backorders',
+			);
+			$sample   = array(
+				'',
+				'SKU-001',
+				'99.90',
+				'79.90',
+				'yes',
+				'25',
+				'instock',
+				'no',
+			);
+		} else {
+			$filename = 'woocommerce-full-product-import-template.csv';
+			$headers  = array(
+				'id',
+				'sku',
+				'type',
+				'parent_sku',
+				'name',
+				'slug',
+				'status',
+				'catalog_visibility',
+				'description',
+				'short_description',
+				'regular_price',
+				'sale_price',
+				'sale_start',
+				'sale_end',
+				'tax_status',
+				'tax_class',
+				'manage_stock',
+				'stock_quantity',
+				'stock_status',
+				'backorders',
+				'sold_individually',
+				'weight',
+				'length',
+				'width',
+				'height',
+				'shipping_class',
+				'virtual',
+				'downloadable',
+				'downloads',
+				'download_limit',
+				'download_expiry',
+				'categories',
+				'tags',
+				'featured_image',
+				'gallery_images',
+				'attributes',
+				'variation_attributes',
+				'default_attributes',
+				'external_url',
+				'button_text',
+				'grouped_products',
+				'purchase_note',
+				'menu_order',
+				'reviews_allowed',
+				'meta:brand',
+			);
+			$sample   = array(
+				'',
+				'SKU-001',
+				'simple',
+				'',
+				'Example Product',
+				'example-product',
+				'draft',
+				'visible',
+				'Long product description',
+				'Short product description',
+				'99.90',
+				'79.90',
+				'2026-09-01',
+				'2026-09-10',
+				'taxable',
+				'',
+				'yes',
+				'25',
+				'instock',
+				'no',
+				'no',
+				'1.2',
+				'20',
+				'10',
+				'5',
+				'Standard',
+				'no',
+				'no',
+				'',
+				'-1',
+				'-1',
+				'Example Category > Child|Sale',
+				'featured|example',
+				'',
+				'',
+				'Color=Red|Blue;Size=S|M|L',
+				'',
+				'',
+				'',
+				'',
+				'',
+				'',
+				'0',
+				'yes',
+				'Example Brand',
+			);
+		}
+
+		nocache_headers();
+		header( 'Content-Type: text/csv; charset=utf-8' );
+		header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+
+		$output = fopen( 'php://output', 'wb' );
+
+		if ( false === $output ) {
+			wp_die( esc_html__( 'Could not open the output stream.', 'wc-product-importer' ) );
+		}
+
+		// UTF-8 BOM improves Excel compatibility.
+		fwrite( $output, "\xEF\xBB\xBF" );
+		fputcsv( $output, $headers, ',', '"', '' );
+		fputcsv( $output, $sample, ',', '"', '' );
+		fclose( $output );
+		exit;
+	}
+}
+
+add_action( 'plugins_loaded', array( 'WC_Single_File_Product_Importer', 'init' ), 20 );
