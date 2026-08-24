@@ -1,0 +1,1 @@
+# woocommerce-product-import-excel-price
