@@ -1,0 +1,24 @@
+{
+    "name": "shahinilderemi/wc-product-importer",
+    "description": "A dependency-free CSV and XLSX product importer for WooCommerce.",
+    "type": "wordpress-plugin",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4"
+    },
+    "suggest": {
+        "ext-simplexml": "Required when importing XLSX workbooks.",
+        "ext-zip": "Required when importing XLSX workbooks."
+    },
+    "scripts": {
+        "lint": [
+            "php -l wc-product-importer.php",
+            "php -l tests/run.php"
+        ],
+        "test": "php tests/run.php",
+        "check": [
+            "@lint",
+            "@test"
+        ]
+    }
+}

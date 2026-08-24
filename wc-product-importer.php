@@ -1,14 +1,15 @@
 <?php
 /**
  * Plugin Name: WooCommerce Product Importer
- * Plugin URI:  https://example.com/
  * Description: Imports and updates WooCommerce products from XLSX or CSV files. Includes a full product import mode and a price/inventory update mode.
- * Version:     1.0.0
- * Author:      Your Name
- * License:     GPL-2.0-or-later
+ * Version:     1.1.0
+ * Author:      Shahin ILDEREMI
+ * License:     MIT
+ * License URI: https://opensource.org/license/mit
  * Text Domain: wc-product-importer
  * Requires at least: 6.5
  * Requires PHP: 7.4
+ * Requires Plugins: woocommerce
  * WC requires at least: 8.0
  * WC tested up to: 11.0
  */
@@ -17,7 +18,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class WC_Single_File_Product_Importer {
 
-	const VERSION            = '1.0.0';
+	const VERSION            = '1.1.0';
 	const MENU_SLUG          = 'wc-product-importer';
 	const NONCE_ACTION       = 'wc_sfpi_import_products';
 	const NONCE_NAME         = 'wc_sfpi_nonce';
@@ -25,7 +26,16 @@ final class WC_Single_File_Product_Importer {
 	const TEMPLATE_NONCE     = 'wc_sfpi_download_template_nonce';
 	const MAX_FILE_SIZE      = 20971520; // 20 MB.
 	const MAX_ROWS           = 10000;
+	const MAX_COLUMNS        = 256;
+	const MAX_XLSX_XML_SIZE  = 33554432; // 32 MB of uncompressed XML.
 	const CLEAR_TOKEN        = '__CLEAR__';
+
+	/**
+	 * Image IDs resolved during the current request, keyed by source value.
+	 *
+	 * @var array
+	 */
+	private static $resolved_image_ids = array();
 
 	/**
 	 * Bootstrap the plugin after all plugins have loaded.
@@ -372,56 +382,48 @@ final class WC_Single_File_Product_Importer {
 			}
 
 			$headers = self::normalize_headers( array_shift( $rows ) );
-
-			if ( empty( $headers ) ) {
-				throw new RuntimeException( __( 'The header row is empty.', 'wc-product-importer' ) );
-			}
-
-			if ( count( $headers ) !== count( array_unique( $headers ) ) ) {
-				throw new RuntimeException( __( 'The file contains duplicate column names after normalization.', 'wc-product-importer' ) );
-			}
-
-			if ( ! in_array( 'sku', $headers, true ) && ! in_array( 'id', $headers, true ) ) {
-				throw new RuntimeException( __( 'The file must contain an "sku" or "id" column.', 'wc-product-importer' ) );
-			}
+			self::validate_import_headers( $headers, $mode );
 
 			$seen_products = array();
 
 			foreach ( $rows as $index => $row_values ) {
 				$excel_row_number = $index + 2;
-				$row              = self::combine_row( $headers, $row_values );
-
-				if ( self::row_is_empty( $row ) ) {
-					++$result['skipped'];
-					continue;
-				}
-
-				$sku = self::get_string( $row, 'sku' );
-				$id  = self::get_int( $row, 'id' );
-
-				$identity = $id > 0 ? 'id:' . $id : 'sku:' . strtolower( $sku );
-
-				if ( 'sku:' === $identity ) {
-					$result['errors'][] = self::error_entry(
-						$excel_row_number,
-						'',
-						__( 'This row does not contain a valid product ID or SKU.', 'wc-product-importer' )
-					);
-					continue;
-				}
-
-				if ( isset( $seen_products[ $identity ] ) ) {
-					$result['errors'][] = self::error_entry(
-						$excel_row_number,
-						$sku,
-						__( 'Duplicate product identifier in the same import file.', 'wc-product-importer' )
-					);
-					continue;
-				}
-
-				$seen_products[ $identity ] = true;
+				$sku              = '';
 
 				try {
+					$row = self::combine_row( $headers, $row_values );
+
+					if ( self::row_is_empty( $row ) ) {
+						++$result['skipped'];
+						continue;
+					}
+
+					$sku        = self::get_string( $row, 'sku' );
+					$id         = self::get_int( $row, 'id' );
+					$identities = array();
+
+					if ( $id > 0 ) {
+						$identities[] = 'id:' . $id;
+					}
+
+					if ( '' !== $sku ) {
+						$identities[] = 'sku:' . strtolower( $sku );
+					}
+
+					if ( empty( $identities ) ) {
+						throw new RuntimeException( __( 'This row does not contain a valid product ID or SKU.', 'wc-product-importer' ) );
+					}
+
+					foreach ( $identities as $identity ) {
+						if ( isset( $seen_products[ $identity ] ) ) {
+							throw new RuntimeException( __( 'Duplicate product identifier in the same import file.', 'wc-product-importer' ) );
+						}
+					}
+
+					foreach ( $identities as $identity ) {
+						$seen_products[ $identity ] = true;
+					}
+
 					if ( 'price_stock' === $mode ) {
 						self::import_price_stock_row( $row );
 					} else {
@@ -757,12 +759,12 @@ final class WC_Single_File_Product_Importer {
 
 		if ( self::has_value_or_clear( $row, 'download_limit' ) ) {
 			$value = self::text_or_clear( $row['download_limit'] );
-			$product->set_download_limit( '' === $value ? -1 : (int) $value );
+			$product->set_download_limit( '' === $value ? -1 : self::integer_value( $value, 'download_limit', -1 ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'download_expiry' ) ) {
 			$value = self::text_or_clear( $row['download_expiry'] );
-			$product->set_download_expiry( '' === $value ? -1 : (int) $value );
+			$product->set_download_expiry( '' === $value ? -1 : self::integer_value( $value, 'download_expiry', -1 ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'purchase_note' ) ) {
@@ -770,7 +772,7 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		if ( self::has_value( $row, 'menu_order' ) ) {
-			$product->set_menu_order( (int) $row['menu_order'] );
+			$product->set_menu_order( self::integer_value( $row['menu_order'], 'menu_order' ) );
 		}
 
 		if ( self::has_value( $row, 'reviews_allowed' ) ) {
@@ -829,7 +831,14 @@ final class WC_Single_File_Product_Importer {
 
 		if ( $product->is_type( 'external' ) ) {
 			if ( self::has_value_or_clear( $row, 'external_url' ) ) {
-				$product->set_product_url( esc_url_raw( self::text_or_clear( $row['external_url'] ) ) );
+				$value = self::text_or_clear( $row['external_url'] );
+				$url   = esc_url_raw( $value );
+
+				if ( '' !== $value && ( '' === $url || ! wp_http_validate_url( $url ) ) ) {
+					throw new RuntimeException( __( 'external_url must be a valid HTTP or HTTPS URL.', 'wc-product-importer' ) );
+				}
+
+				$product->set_product_url( $url );
 			}
 
 			if ( self::has_value_or_clear( $row, 'button_text' ) ) {
@@ -1053,6 +1062,7 @@ final class WC_Single_File_Product_Importer {
 	 * @param string $value        Raw value.
 	 * @param bool   $for_variation Whether attributes should be variation attributes.
 	 * @return array
+	 * @throws RuntimeException On malformed attributes.
 	 */
 	private static function parse_parent_attributes( $value, $for_variation ) {
 		if ( '' === $value ) {
@@ -1061,20 +1071,41 @@ final class WC_Single_File_Product_Importer {
 
 		$attributes = array();
 		$position   = 0;
+		$seen       = array();
 
 		foreach ( array_filter( array_map( 'trim', explode( ';', $value ) ), 'strlen' ) as $definition ) {
 			$parts = explode( '=', $definition, 2 );
 
 			if ( 2 !== count( $parts ) ) {
-				continue;
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: malformed attribute definition. */
+						__( 'Malformed attribute definition "%s". Use Name=Value|Value.', 'wc-product-importer' ),
+						$definition
+					)
+				);
 			}
 
 			$name    = sanitize_text_field( trim( $parts[0] ) );
 			$options = array_map( 'sanitize_text_field', self::split_pipe( $parts[1] ) );
 
 			if ( '' === $name || empty( $options ) ) {
-				continue;
+				throw new RuntimeException( __( 'Each product attribute must have a name and at least one value.', 'wc-product-importer' ) );
 			}
+
+			$key = sanitize_title( $name );
+
+			if ( isset( $seen[ $key ] ) ) {
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: duplicate attribute name. */
+						__( 'Duplicate attribute definition: %s.', 'wc-product-importer' ),
+						$name
+					)
+				);
+			}
+
+			$seen[ $key ] = true;
 
 			$attribute = new WC_Product_Attribute();
 			$attribute->set_id( 0 );
@@ -1098,6 +1129,7 @@ final class WC_Single_File_Product_Importer {
 	 *
 	 * @param string $value Raw value.
 	 * @return array
+	 * @throws RuntimeException On malformed attributes.
 	 */
 	private static function parse_variation_attributes( $value ) {
 		$attributes = array();
@@ -1110,15 +1142,33 @@ final class WC_Single_File_Product_Importer {
 			$parts = explode( '=', $definition, 2 );
 
 			if ( 2 !== count( $parts ) ) {
-				continue;
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: malformed attribute definition. */
+						__( 'Malformed variation attribute "%s". Use Name=Value.', 'wc-product-importer' ),
+						$definition
+					)
+				);
 			}
 
 			$name  = sanitize_title( trim( $parts[0] ) );
 			$term  = sanitize_text_field( trim( $parts[1] ) );
 
-			if ( '' !== $name ) {
-				$attributes[ $name ] = $term;
+			if ( '' === $name ) {
+				throw new RuntimeException( __( 'Each variation attribute must have a name.', 'wc-product-importer' ) );
 			}
+
+			if ( array_key_exists( $name, $attributes ) ) {
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: duplicate attribute name. */
+						__( 'Duplicate variation attribute definition: %s.', 'wc-product-importer' ),
+						$name
+					)
+				);
+			}
+
+			$attributes[ $name ] = $term;
 		}
 
 		return $attributes;
@@ -1182,6 +1232,7 @@ final class WC_Single_File_Product_Importer {
 	 *
 	 * @param string $value Raw download definitions.
 	 * @return array
+	 * @throws RuntimeException On malformed downloads.
 	 */
 	private static function parse_downloads( $value ) {
 		$downloads = array();
@@ -1194,14 +1245,20 @@ final class WC_Single_File_Product_Importer {
 			$parts = explode( '=', $definition, 2 );
 
 			if ( 2 !== count( $parts ) ) {
-				continue;
+				throw new RuntimeException(
+					sprintf(
+						/* translators: %s: malformed download definition. */
+						__( 'Malformed download definition "%s". Use Name=https://example.com/file.', 'wc-product-importer' ),
+						$definition
+					)
+				);
 			}
 
 			$name = sanitize_text_field( trim( $parts[0] ) );
 			$url  = esc_url_raw( trim( $parts[1] ) );
 
-			if ( '' === $name || '' === $url ) {
-				continue;
+			if ( '' === $name || '' === $url || ! wp_http_validate_url( $url ) ) {
+				throw new RuntimeException( __( 'Each download must have a name and a valid HTTP or HTTPS URL.', 'wc-product-importer' ) );
 			}
 
 			$download = new WC_Product_Download();
@@ -1226,11 +1283,17 @@ final class WC_Single_File_Product_Importer {
 	private static function resolve_image_id( $value, $product_id ) {
 		$value = trim( $value );
 
+		if ( isset( self::$resolved_image_ids[ $value ] ) ) {
+			return self::$resolved_image_ids[ $value ];
+		}
+
 		if ( ctype_digit( $value ) ) {
 			$attachment_id = (int) $value;
 
 			if ( wp_attachment_is_image( $attachment_id ) ) {
-				return $attachment_id;
+				self::$resolved_image_ids[ $value ] = $attachment_id;
+
+				return self::$resolved_image_ids[ $value ];
 			}
 
 			throw new RuntimeException( __( 'An image attachment ID in the file is invalid.', 'wc-product-importer' ) );
@@ -1245,7 +1308,9 @@ final class WC_Single_File_Product_Importer {
 		$existing_id = attachment_url_to_postid( $url );
 
 		if ( $existing_id && wp_attachment_is_image( $existing_id ) ) {
-			return (int) $existing_id;
+			self::$resolved_image_ids[ $value ] = (int) $existing_id;
+
+			return self::$resolved_image_ids[ $value ];
 		}
 
 		$existing = get_posts(
@@ -1261,7 +1326,9 @@ final class WC_Single_File_Product_Importer {
 		);
 
 		if ( ! empty( $existing[0] ) && wp_attachment_is_image( $existing[0] ) ) {
-			return (int) $existing[0];
+			self::$resolved_image_ids[ $value ] = (int) $existing[0];
+
+			return self::$resolved_image_ids[ $value ];
 		}
 
 		require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -1275,8 +1342,9 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		update_post_meta( $attachment_id, '_wc_sfpi_source_url', $url );
+		self::$resolved_image_ids[ $value ] = (int) $attachment_id;
 
-		return (int) $attachment_id;
+		return self::$resolved_image_ids[ $value ];
 	}
 
 	/**
@@ -1309,38 +1377,59 @@ final class WC_Single_File_Product_Importer {
 			throw new RuntimeException( __( 'The CSV file could not be opened.', 'wc-product-importer' ) );
 		}
 
-		$first_line = fgets( $handle );
+		try {
+			$first_line = fgets( $handle );
 
-		if ( false === $first_line ) {
+			if ( false === $first_line ) {
+				throw new RuntimeException( __( 'The CSV file is empty.', 'wc-product-importer' ) );
+			}
+
+			if ( false !== strpos( $first_line, "\0" ) ) {
+				throw new RuntimeException( __( 'The CSV file contains binary data and cannot be imported.', 'wc-product-importer' ) );
+			}
+
+			$delimiter = self::detect_csv_delimiter( $first_line );
+			rewind( $handle );
+
+			$rows = array();
+
+			while ( false !== ( $row = fgetcsv( $handle, 0, $delimiter, '"', '' ) ) ) {
+				if ( count( $row ) > self::MAX_COLUMNS ) {
+					throw new RuntimeException(
+						sprintf(
+							/* translators: %d: maximum number of columns. */
+							__( 'The CSV contains more than the allowed %d columns.', 'wc-product-importer' ),
+							self::MAX_COLUMNS
+						)
+					);
+				}
+
+				foreach ( $row as $value ) {
+					if ( is_string( $value ) && false !== strpos( $value, "\0" ) ) {
+						throw new RuntimeException( __( 'The CSV file contains binary data and cannot be imported.', 'wc-product-importer' ) );
+					}
+				}
+
+				if ( ! empty( $row[0] ) && 0 === strpos( $row[0], "\xEF\xBB\xBF" ) ) {
+					$row[0] = substr( $row[0], 3 );
+				}
+
+				$rows[] = array_map(
+					static function ( $value ) {
+						return is_string( $value ) ? trim( $value ) : $value;
+					},
+					$row
+				);
+
+				if ( count( $rows ) > self::MAX_ROWS + 1 ) {
+					break;
+				}
+			}
+
+			return $rows;
+		} finally {
 			fclose( $handle );
-			throw new RuntimeException( __( 'The CSV file is empty.', 'wc-product-importer' ) );
 		}
-
-		$delimiter = self::detect_csv_delimiter( $first_line );
-		rewind( $handle );
-
-		$rows = array();
-
-		while ( false !== ( $row = fgetcsv( $handle, 0, $delimiter, '"', '' ) ) ) {
-			if ( ! empty( $row[0] ) && 0 === strpos( $row[0], "\xEF\xBB\xBF" ) ) {
-				$row[0] = substr( $row[0], 3 );
-			}
-
-			$rows[] = array_map(
-				static function ( $value ) {
-					return is_string( $value ) ? trim( $value ) : $value;
-				},
-				$row
-			);
-
-			if ( count( $rows ) > self::MAX_ROWS + 1 ) {
-				break;
-			}
-		}
-
-		fclose( $handle );
-
-		return $rows;
 	}
 
 	/**
@@ -1351,9 +1440,9 @@ final class WC_Single_File_Product_Importer {
 	 */
 	private static function detect_csv_delimiter( $line ) {
 		$delimiters = array(
-			','  => substr_count( $line, ',' ),
-			';'  => substr_count( $line, ';' ),
-			"\t" => substr_count( $line, "\t" ),
+			','  => self::count_unquoted_delimiter( $line, ',' ),
+			';'  => self::count_unquoted_delimiter( $line, ';' ),
+			"\t" => self::count_unquoted_delimiter( $line, "\t" ),
 		);
 
 		arsort( $delimiters );
@@ -1361,6 +1450,39 @@ final class WC_Single_File_Product_Importer {
 		$delimiter = key( $delimiters );
 
 		return $delimiters[ $delimiter ] > 0 ? $delimiter : ',';
+	}
+
+	/**
+	 * Count delimiter characters that are outside quoted CSV fields.
+	 *
+	 * @param string $line      CSV line.
+	 * @param string $delimiter Candidate delimiter.
+	 * @return int
+	 */
+	private static function count_unquoted_delimiter( $line, $delimiter ) {
+		$count     = 0;
+		$in_quotes = false;
+		$length    = strlen( $line );
+
+		for ( $index = 0; $index < $length; ++$index ) {
+			$character = $line[ $index ];
+
+			if ( '"' === $character ) {
+				if ( $in_quotes && $index + 1 < $length && '"' === $line[ $index + 1 ] ) {
+					++$index;
+					continue;
+				}
+
+				$in_quotes = ! $in_quotes;
+				continue;
+			}
+
+			if ( ! $in_quotes && $delimiter === $character ) {
+				++$count;
+			}
+		}
+
+		return $count;
 	}
 
 	/**
@@ -1392,13 +1514,21 @@ final class WC_Single_File_Product_Importer {
 				throw new RuntimeException( __( 'The uploaded XLSX file is missing required workbook data.', 'wc-product-importer' ) );
 			}
 
-			$shared_strings = self::xlsx_shared_strings( $zip );
-			$sheet_path     = self::xlsx_first_sheet_path( $zip );
-			$sheet_xml      = $zip->getFromName( $sheet_path );
+			$sheet_path = self::xlsx_first_sheet_path( $zip );
 
-			if ( false === $sheet_xml ) {
-				throw new RuntimeException( __( 'The first Excel worksheet could not be read.', 'wc-product-importer' ) );
-			}
+			self::validate_xlsx_xml_budget(
+				$zip,
+				array(
+					'[Content_Types].xml',
+					'xl/workbook.xml',
+					'xl/_rels/workbook.xml.rels',
+					'xl/sharedStrings.xml',
+					$sheet_path,
+				)
+			);
+
+			$shared_strings = self::xlsx_shared_strings( $zip );
+			$sheet_xml      = self::xlsx_entry_contents( $zip, $sheet_path, true );
 
 			$xml = self::safe_simplexml( $sheet_xml );
 
@@ -1422,6 +1552,21 @@ final class WC_Single_File_Product_Importer {
 					$attributes   = $cell->attributes();
 					$reference    = isset( $attributes['r'] ) ? (string) $attributes['r'] : '';
 					$column_index = self::xlsx_column_index( $reference );
+
+					if ( $column_index < 0 ) {
+						throw new RuntimeException( __( 'The Excel worksheet contains a cell without a valid reference.', 'wc-product-importer' ) );
+					}
+
+					if ( $column_index >= self::MAX_COLUMNS ) {
+						throw new RuntimeException(
+							sprintf(
+								/* translators: %d: maximum number of columns. */
+								__( 'The Excel worksheet contains a cell beyond the allowed %d columns.', 'wc-product-importer' ),
+								self::MAX_COLUMNS
+							)
+						);
+					}
+
 					$type         = isset( $attributes['t'] ) ? (string) $attributes['t'] : 'n';
 					$value        = '';
 
@@ -1470,13 +1615,100 @@ final class WC_Single_File_Product_Importer {
 	}
 
 	/**
+	 * Read a size-limited XML entry from an XLSX archive.
+	 *
+	 * @param ZipArchive $zip      XLSX archive.
+	 * @param string     $path     Entry path.
+	 * @param bool       $required Whether a missing entry is an error.
+	 * @return string|false
+	 * @throws RuntimeException On a missing, unreadable, or oversized entry.
+	 */
+	private static function xlsx_entry_contents( ZipArchive $zip, $path, $required ) {
+		$stat = $zip->statName( $path );
+
+		if ( false === $stat ) {
+			if ( $required ) {
+				throw new RuntimeException( __( 'The Excel workbook is missing required XML data.', 'wc-product-importer' ) );
+			}
+
+			return false;
+		}
+
+		$size = isset( $stat['size'] ) ? (int) $stat['size'] : 0;
+
+		if ( $size < 0 || $size > self::MAX_XLSX_XML_SIZE ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: XLSX archive entry path. */
+					__( 'The Excel workbook contains an oversized XML entry: %s.', 'wc-product-importer' ),
+					$path
+				)
+			);
+		}
+
+		$contents = $zip->getFromName( $path );
+
+		if ( false === $contents ) {
+			if ( $required ) {
+				throw new RuntimeException( __( 'Required Excel workbook XML could not be read.', 'wc-product-importer' ) );
+			}
+
+			return false;
+		}
+
+		if ( strlen( $contents ) > self::MAX_XLSX_XML_SIZE ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: XLSX archive entry path. */
+					__( 'The Excel workbook contains an oversized XML entry: %s.', 'wc-product-importer' ),
+					$path
+				)
+			);
+		}
+
+		return $contents;
+	}
+
+	/**
+	 * Enforce a total uncompressed-size budget for XML used by the importer.
+	 *
+	 * @param ZipArchive $zip   XLSX archive.
+	 * @param array      $paths XML entry paths.
+	 * @return void
+	 * @throws RuntimeException When the XML budget is exceeded.
+	 */
+	private static function validate_xlsx_xml_budget( ZipArchive $zip, array $paths ) {
+		$total = 0;
+
+		foreach ( array_unique( $paths ) as $path ) {
+			$stat = $zip->statName( $path );
+
+			if ( false === $stat ) {
+				continue;
+			}
+
+			$size = isset( $stat['size'] ) ? (int) $stat['size'] : 0;
+
+			if ( $size < 0 || $size > self::MAX_XLSX_XML_SIZE ) {
+				throw new RuntimeException( __( 'The Excel workbook exceeds the safe uncompressed XML limit.', 'wc-product-importer' ) );
+			}
+
+			$total += $size;
+
+			if ( $total > self::MAX_XLSX_XML_SIZE ) {
+				throw new RuntimeException( __( 'The Excel workbook exceeds the safe uncompressed XML limit.', 'wc-product-importer' ) );
+			}
+		}
+	}
+
+	/**
 	 * Load XLSX shared strings.
 	 *
 	 * @param ZipArchive $zip XLSX archive.
 	 * @return array
 	 */
 	private static function xlsx_shared_strings( ZipArchive $zip ) {
-		$xml_string = $zip->getFromName( 'xl/sharedStrings.xml' );
+		$xml_string = self::xlsx_entry_contents( $zip, 'xl/sharedStrings.xml', false );
 
 		if ( false === $xml_string ) {
 			return array();
@@ -1485,7 +1717,7 @@ final class WC_Single_File_Product_Importer {
 		$xml = self::safe_simplexml( $xml_string );
 
 		if ( ! $xml ) {
-			return array();
+			throw new RuntimeException( __( 'The Excel shared-strings table contains invalid XML.', 'wc-product-importer' ) );
 		}
 
 		$strings  = array();
@@ -1518,18 +1750,22 @@ final class WC_Single_File_Product_Importer {
 	 * @throws RuntimeException On malformed workbook.
 	 */
 	private static function xlsx_first_sheet_path( ZipArchive $zip ) {
-		$workbook_xml = $zip->getFromName( 'xl/workbook.xml' );
-		$rels_xml     = $zip->getFromName( 'xl/_rels/workbook.xml.rels' );
+		$workbook_xml = self::xlsx_entry_contents( $zip, 'xl/workbook.xml', true );
+		$rels_xml     = self::xlsx_entry_contents( $zip, 'xl/_rels/workbook.xml.rels', false );
+		$workbook     = self::safe_simplexml( $workbook_xml );
 
-		if ( false === $workbook_xml || false === $rels_xml ) {
+		if ( ! $workbook ) {
+			throw new RuntimeException( __( 'The Excel workbook contains invalid XML.', 'wc-product-importer' ) );
+		}
+
+		if ( false === $rels_xml ) {
 			return 'xl/worksheets/sheet1.xml';
 		}
 
-		$workbook = self::safe_simplexml( $workbook_xml );
-		$rels     = self::safe_simplexml( $rels_xml );
+		$rels = self::safe_simplexml( $rels_xml );
 
-		if ( ! $workbook || ! $rels ) {
-			return 'xl/worksheets/sheet1.xml';
+		if ( ! $rels ) {
+			throw new RuntimeException( __( 'The Excel workbook relationships contain invalid XML.', 'wc-product-importer' ) );
 		}
 
 		$workbook->registerXPathNamespace( 'main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
@@ -1554,14 +1790,22 @@ final class WC_Single_File_Product_Importer {
 			$attributes = $relationship->attributes();
 
 			if ( isset( $attributes['Id'], $attributes['Target'] ) && (string) $attributes['Id'] === $relationship_id ) {
-				$target = (string) $attributes['Target'];
+				$target = str_replace( '\\', '/', (string) $attributes['Target'] );
 				$target = ltrim( $target, '/' );
 
-				if ( 0 === strpos( $target, 'xl/' ) ) {
-					return $target;
+				if ( 0 !== strpos( $target, 'xl/' ) ) {
+					$target = 'xl/' . $target;
 				}
 
-				return 'xl/' . $target;
+				if (
+					false !== strpos( $target, '../' ) ||
+					0 !== strpos( $target, 'xl/worksheets/' ) ||
+					'.xml' !== strtolower( substr( $target, -4 ) )
+				) {
+					throw new RuntimeException( __( 'The first Excel worksheet has an invalid archive path.', 'wc-product-importer' ) );
+				}
+
+				return $target;
 			}
 		}
 
@@ -1575,6 +1819,10 @@ final class WC_Single_File_Product_Importer {
 	 * @return SimpleXMLElement|false
 	 */
 	private static function safe_simplexml( $xml ) {
+		if ( false !== stripos( $xml, '<!DOCTYPE' ) ) {
+			return false;
+		}
+
 		$previous = libxml_use_internal_errors( true );
 		$object   = simplexml_load_string( $xml, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA );
 		libxml_clear_errors();
@@ -1623,8 +1871,8 @@ final class WC_Single_File_Product_Importer {
 	 * @return int
 	 */
 	private static function xlsx_column_index( $reference ) {
-		if ( ! preg_match( '/^([A-Z]+)/i', $reference, $matches ) ) {
-			return 0;
+		if ( ! preg_match( '/^([A-Z]+)[1-9][0-9]*$/i', $reference, $matches ) ) {
+			return -1;
 		}
 
 		$letters = strtoupper( $matches[1] );
@@ -1636,6 +1884,144 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		return $index - 1;
+	}
+
+	/**
+	 * Get the canonical full-import columns.
+	 *
+	 * @return array
+	 */
+	private static function full_import_headers() {
+		return array(
+			'id',
+			'sku',
+			'type',
+			'parent_sku',
+			'name',
+			'slug',
+			'status',
+			'catalog_visibility',
+			'description',
+			'short_description',
+			'regular_price',
+			'sale_price',
+			'sale_start',
+			'sale_end',
+			'tax_status',
+			'tax_class',
+			'manage_stock',
+			'stock_quantity',
+			'stock_status',
+			'backorders',
+			'sold_individually',
+			'weight',
+			'length',
+			'width',
+			'height',
+			'shipping_class',
+			'virtual',
+			'downloadable',
+			'downloads',
+			'download_limit',
+			'download_expiry',
+			'categories',
+			'tags',
+			'featured_image',
+			'gallery_images',
+			'attributes',
+			'variation_attributes',
+			'default_attributes',
+			'external_url',
+			'button_text',
+			'grouped_products',
+			'purchase_note',
+			'menu_order',
+			'reviews_allowed',
+		);
+	}
+
+	/**
+	 * Get the canonical price and inventory columns.
+	 *
+	 * @return array
+	 */
+	private static function price_stock_headers() {
+		return array(
+			'id',
+			'sku',
+			'regular_price',
+			'sale_price',
+			'manage_stock',
+			'stock_quantity',
+			'stock_status',
+			'backorders',
+		);
+	}
+
+	/**
+	 * Validate normalized headers for the selected import mode.
+	 *
+	 * @param array  $headers Normalized headers.
+	 * @param string $mode    Import mode.
+	 * @return void
+	 * @throws RuntimeException On invalid headers.
+	 */
+	private static function validate_import_headers( array $headers, $mode ) {
+		if ( empty( $headers ) ) {
+			throw new RuntimeException( __( 'The header row is empty.', 'wc-product-importer' ) );
+		}
+
+		if ( count( $headers ) > self::MAX_COLUMNS ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %d: maximum number of columns. */
+					__( 'The import contains too many columns. The maximum is %d.', 'wc-product-importer' ),
+					self::MAX_COLUMNS
+				)
+			);
+		}
+
+		if ( in_array( '', $headers, true ) ) {
+			throw new RuntimeException( __( 'Every populated header cell must contain a column name.', 'wc-product-importer' ) );
+		}
+
+		if ( count( $headers ) !== count( array_unique( $headers ) ) ) {
+			throw new RuntimeException( __( 'The file contains duplicate column names after normalization.', 'wc-product-importer' ) );
+		}
+
+		if ( ! in_array( 'sku', $headers, true ) && ! in_array( 'id', $headers, true ) ) {
+			throw new RuntimeException( __( 'The file must contain an "sku" or "id" column.', 'wc-product-importer' ) );
+		}
+
+		$allowed = 'price_stock' === $mode ? self::price_stock_headers() : self::full_import_headers();
+		$unknown = array();
+
+		foreach ( $headers as $header ) {
+			if ( in_array( $header, $allowed, true ) ) {
+				continue;
+			}
+
+			if (
+				'full' === $mode &&
+				0 === strpos( $header, 'meta:' ) &&
+				strlen( $header ) > 5 &&
+				'_' !== substr( $header, 5, 1 )
+			) {
+				continue;
+			}
+
+			$unknown[] = $header;
+		}
+
+		if ( ! empty( $unknown ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: comma-separated column names. */
+					__( 'Unsupported column(s) for this import mode: %s.', 'wc-product-importer' ),
+					implode( ', ', $unknown )
+				)
+			);
+		}
 	}
 
 	/**
@@ -1659,12 +2045,16 @@ final class WC_Single_File_Product_Importer {
 			'qty'               => 'stock_quantity',
 			'inventory'         => 'stock_quantity',
 			'manage_inventory'  => 'manage_stock',
-			'featured_image_url'=> 'featured_image',
+			'featured_image_url' => 'featured_image',
 			'image'             => 'featured_image',
 			'gallery'           => 'gallery_images',
 			'parent'            => 'parent_sku',
 			'product_url'       => 'external_url',
 		);
+
+		while ( ! empty( $headers ) && '' === trim( (string) end( $headers ) ) ) {
+			array_pop( $headers );
+		}
 
 		$normalized = array();
 
@@ -1673,7 +2063,7 @@ final class WC_Single_File_Product_Importer {
 
 			if ( 0 === strpos( strtolower( $header ), 'meta:' ) ) {
 				$key          = sanitize_key( substr( $header, 5 ) );
-				$normalized[] = 'meta:' . $key;
+				$normalized[] = '' === $key ? '' : 'meta:' . $key;
 				continue;
 			}
 
@@ -1694,8 +2084,27 @@ final class WC_Single_File_Product_Importer {
 	 * @param array $headers Header names.
 	 * @param array $values  Row values.
 	 * @return array
+	 * @throws RuntimeException On unexpected row data.
 	 */
 	private static function combine_row( array $headers, array $values ) {
+		if ( count( $values ) > self::MAX_COLUMNS ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %d: maximum number of columns. */
+					__( 'This row contains more than the allowed %d columns.', 'wc-product-importer' ),
+					self::MAX_COLUMNS
+				)
+			);
+		}
+
+		$extra_values = array_slice( $values, count( $headers ) );
+
+		foreach ( $extra_values as $extra_value ) {
+			if ( '' !== trim( (string) $extra_value ) ) {
+				throw new RuntimeException( __( 'This row contains data beyond the last named header column.', 'wc-product-importer' ) );
+			}
+		}
+
 		$row = array();
 
 		foreach ( $headers as $index => $header ) {
@@ -1776,7 +2185,49 @@ final class WC_Single_File_Product_Importer {
 	 * @return int
 	 */
 	private static function get_int( array $row, $key ) {
-		return self::has_value( $row, $key ) ? absint( $row[ $key ] ) : 0;
+		return self::has_value( $row, $key ) ? self::integer_value( $row[ $key ], $key, 1 ) : 0;
+	}
+
+	/**
+	 * Parse an integer and optionally enforce a minimum value.
+	 *
+	 * @param mixed    $value   Raw value.
+	 * @param string   $field   Field name.
+	 * @param int|null $minimum Minimum accepted value, or null for no minimum.
+	 * @return int
+	 * @throws RuntimeException On an invalid or out-of-range integer.
+	 */
+	private static function integer_value( $value, $field, $minimum = null ) {
+		$raw = trim( (string) $value );
+
+		if ( ! preg_match( '/^[+-]?[0-9]+$/', $raw ) ) {
+			$integer = false;
+		} else {
+			$is_negative = '-' === substr( $raw, 0, 1 );
+			$digits      = ltrim( $raw, '+-' );
+			$digits      = ltrim( $digits, '0' );
+			$digits      = '' === $digits ? '0' : $digits;
+			$limit       = $is_negative ? substr( (string) PHP_INT_MIN, 1 ) : (string) PHP_INT_MAX;
+
+			if ( strlen( $digits ) > strlen( $limit ) || ( strlen( $digits ) === strlen( $limit ) && strcmp( $digits, $limit ) > 0 ) ) {
+				$integer = false;
+			} else {
+				$integer = (int) $raw;
+			}
+		}
+
+		if ( false === $integer || ( null !== $minimum && $integer < $minimum ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: 1: invalid value, 2: field name. */
+					__( '"%1$s" is not a valid integer for %2$s.', 'wc-product-importer' ),
+					$value,
+					$field
+				)
+			);
+		}
+
+		return (int) $integer;
 	}
 
 	/**
@@ -1989,16 +2440,7 @@ final class WC_Single_File_Product_Importer {
 
 		if ( 'price_stock' === $mode ) {
 			$filename = 'woocommerce-price-stock-import-template.csv';
-			$headers  = array(
-				'id',
-				'sku',
-				'regular_price',
-				'sale_price',
-				'manage_stock',
-				'stock_quantity',
-				'stock_status',
-				'backorders',
-			);
+			$headers  = self::price_stock_headers();
 			$sample   = array(
 				'',
 				'SKU-001',
@@ -2011,53 +2453,7 @@ final class WC_Single_File_Product_Importer {
 			);
 		} else {
 			$filename = 'woocommerce-full-product-import-template.csv';
-			$headers  = array(
-				'id',
-				'sku',
-				'type',
-				'parent_sku',
-				'name',
-				'slug',
-				'status',
-				'catalog_visibility',
-				'description',
-				'short_description',
-				'regular_price',
-				'sale_price',
-				'sale_start',
-				'sale_end',
-				'tax_status',
-				'tax_class',
-				'manage_stock',
-				'stock_quantity',
-				'stock_status',
-				'backorders',
-				'sold_individually',
-				'weight',
-				'length',
-				'width',
-				'height',
-				'shipping_class',
-				'virtual',
-				'downloadable',
-				'downloads',
-				'download_limit',
-				'download_expiry',
-				'categories',
-				'tags',
-				'featured_image',
-				'gallery_images',
-				'attributes',
-				'variation_attributes',
-				'default_attributes',
-				'external_url',
-				'button_text',
-				'grouped_products',
-				'purchase_note',
-				'menu_order',
-				'reviews_allowed',
-				'meta:brand',
-			);
+			$headers  = array_merge( self::full_import_headers(), array( 'meta:brand' ) );
 			$sample   = array(
 				'',
 				'SKU-001',
