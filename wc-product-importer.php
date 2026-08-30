@@ -1,9 +1,11 @@
 <?php
 /**
  * Plugin Name: WooCommerce Product Importer
+ * Plugin URI: https://github.com/ildrm/wc-product-importer
  * Description: Imports and updates WooCommerce products from XLSX or CSV files. Includes a full product import mode and a price/inventory update mode.
  * Version:     1.1.0
- * Author:      Shahin ILDEREMI
+ * Author:      Shahin Ilderemi
+ * Author URI:  https://ildrm.com
  * License:     MIT
  * License URI: https://opensource.org/license/mit
  * Text Domain: wc-product-importer
