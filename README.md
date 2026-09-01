@@ -42,7 +42,10 @@ The plugin declares compatibility through WooCommerce 11.0. As with any bulk dat
 | Uploaded file size | 20 MB |
 | Data rows per import | 10,000 |
 | Columns per import | 256 |
+| Parsed cells per import | 500,000 |
+| Bytes per parsed cell | 1 MB |
 | XLSX XML used by the importer, uncompressed | 32 MB total |
+| Remote image size | 10 MB per image |
 
 Your PHP, web server, or WordPress configuration may impose a smaller upload size or execution-time limit.
 
@@ -178,8 +181,8 @@ Every file must contain `id`, `sku`, or both.
 
 | Column | Accepted value / behavior |
 | --- | --- |
-| `regular_price` | Decimal value in the store's expected decimal format. |
-| `sale_price` | Decimal value. |
+| `regular_price` | Non-negative decimal value in the store's expected decimal format. |
+| `sale_price` | Non-negative decimal value. |
 | `sale_start` | Date/time such as `2026-09-01` or `2026-09-01 09:00:00`. |
 | `sale_end` | Date/time such as `2026-09-10` or `2026-09-10 23:59:59`. |
 | `tax_status` | `taxable`, `shipping`, or `none`. |
@@ -235,7 +238,7 @@ tags: summer|featured
 gallery_images: 123|https://example.com/back.jpg
 ```
 
-Remote images are sideloaded into the WordPress media library. A source-URL marker and an in-request cache prevent the same remote image from being downloaded repeatedly by this importer.
+Remote images are sideloaded into the WordPress media library. A source-URL marker and an in-request cache prevent the same remote image from being downloaded repeatedly by this importer. Each download is limited to 10 MB, a 15-second timeout, and three redirects; WordPress validates the initial URL and every redirect against unsafe destinations, and the downloaded file must pass real image-type checks.
 
 ### Attributes and specialized product types
 
@@ -326,7 +329,7 @@ At least one price or inventory field must contain a value in each data row. Oth
 - Uploaded files must be real PHP uploads with a `.csv` or `.xlsx` extension.
 - Output is escaped and custom metadata keys are restricted.
 - XML external network access is disabled, document type declarations are rejected, and workbook relationship paths are constrained to worksheet XML inside the archive.
-- Remote images are validated and downloaded through WordPress media APIs.
+- Remote images use WordPress's safe HTTP API with redirect validation, streaming, a 10 MB response cap, a 15-second timeout, and real image-type verification before media sideloading.
 - Imports run synchronously in the admin HTTP request. Large files and remote images can hit hosting time or memory limits even when they are below the plugin limits.
 - Imports write directly to WooCommerce and are not a dry run. Use staging and backups for important catalogs.
 
@@ -422,6 +425,14 @@ The suite is not a replacement for integration testing in WordPress. Before rele
 6. Describe user-visible changes and any compatibility considerations in the pull request.
 
 ## Changelog
+
+### 1.1.1
+
+- Bounded remote image downloads and added SSRF-safe redirect, response-size, timeout, and real image-type validation.
+- Rejected stale product IDs and duplicate logical products even when one row uses an ID and another uses its SKU.
+- Rejected negative prices and dimensions, reversed sale date ranges, malformed pipe/category values, invalid UTF-8 CSV text, and malformed XLSX cell references and types.
+- Added per-cell and total-cell resource limits and made concurrent taxonomy creation idempotent.
+- Expanded the standalone regression suite for the hardened paths.
 
 ### 1.1.0
 

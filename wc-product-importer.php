@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Product Importer
  * Plugin URI: https://github.com/ildrm/wc-product-importer
  * Description: Imports and updates WooCommerce products from XLSX or CSV files. Includes a full product import mode and a price/inventory update mode.
- * Version:     1.1.0
+ * Version:     1.1.1
  * Author:      Shahin Ilderemi
  * Author URI:  https://ildrm.com
  * License:     MIT
@@ -20,17 +20,22 @@ defined( 'ABSPATH' ) || exit;
 
 final class WC_Single_File_Product_Importer {
 
-	const VERSION            = '1.1.0';
-	const MENU_SLUG          = 'wc-product-importer';
-	const NONCE_ACTION       = 'wc_sfpi_import_products';
-	const NONCE_NAME         = 'wc_sfpi_nonce';
-	const TEMPLATE_ACTION    = 'wc_sfpi_download_template';
-	const TEMPLATE_NONCE     = 'wc_sfpi_download_template_nonce';
-	const MAX_FILE_SIZE      = 20971520; // 20 MB.
-	const MAX_ROWS           = 10000;
-	const MAX_COLUMNS        = 256;
-	const MAX_XLSX_XML_SIZE  = 33554432; // 32 MB of uncompressed XML.
-	const CLEAR_TOKEN        = '__CLEAR__';
+	const VERSION                = '1.1.1';
+	const MENU_SLUG              = 'wc-product-importer';
+	const NONCE_ACTION           = 'wc_sfpi_import_products';
+	const NONCE_NAME             = 'wc_sfpi_nonce';
+	const TEMPLATE_ACTION        = 'wc_sfpi_download_template';
+	const TEMPLATE_NONCE         = 'wc_sfpi_download_template_nonce';
+	const MAX_FILE_SIZE          = 20971520; // 20 MB.
+	const MAX_ROWS               = 10000;
+	const MAX_COLUMNS            = 256;
+	const MAX_IMPORT_CELLS       = 500000;
+	const MAX_CELL_SIZE          = 1048576; // 1 MB per cell.
+	const MAX_XLSX_XML_SIZE      = 33554432; // 32 MB of uncompressed XML.
+	const MAX_REMOTE_IMAGE_SIZE  = 10485760; // 10 MB.
+	const REMOTE_IMAGE_TIMEOUT   = 15;
+	const REMOTE_IMAGE_REDIRECTS = 3;
+	const CLEAR_TOKEN            = '__CLEAR__';
 
 	/**
 	 * Image IDs resolved during the current request, keyed by source value.
@@ -359,6 +364,13 @@ final class WC_Single_File_Product_Importer {
 			return $result;
 		}
 
+		$actual_file_size = filesize( $tmp_name );
+
+		if ( false === $actual_file_size || $actual_file_size <= 0 || $actual_file_size > self::MAX_FILE_SIZE ) {
+			$result['errors'][] = self::error_entry( 0, '', __( 'The uploaded file is empty or exceeds the allowed size.', 'wc-product-importer' ) );
+			return $result;
+		}
+
 		$extension = strtolower( pathinfo( $filename, PATHINFO_EXTENSION ) );
 
 		if ( ! in_array( $extension, array( 'xlsx', 'csv' ), true ) ) {
@@ -400,21 +412,9 @@ final class WC_Single_File_Product_Importer {
 						continue;
 					}
 
-					$sku        = self::get_string( $row, 'sku' );
-					$id         = self::get_int( $row, 'id' );
-					$identities = array();
-
-					if ( $id > 0 ) {
-						$identities[] = 'id:' . $id;
-					}
-
-					if ( '' !== $sku ) {
-						$identities[] = 'sku:' . strtolower( $sku );
-					}
-
-					if ( empty( $identities ) ) {
-						throw new RuntimeException( __( 'This row does not contain a valid product ID or SKU.', 'wc-product-importer' ) );
-					}
+					$sku             = self::get_string( $row, 'sku' );
+					$matched_product = self::find_product( $row );
+					$identities      = self::identity_keys_for_row( $row, $matched_product );
 
 					foreach ( $identities as $identity ) {
 						if ( isset( $seen_products[ $identity ] ) ) {
@@ -427,9 +427,9 @@ final class WC_Single_File_Product_Importer {
 					}
 
 					if ( 'price_stock' === $mode ) {
-						self::import_price_stock_row( $row );
+						self::import_price_stock_row( $row, $matched_product );
 					} else {
-						self::import_full_row( $row );
+						self::import_full_row( $row, $matched_product );
 					}
 
 					++$result['success'];
@@ -451,13 +451,12 @@ final class WC_Single_File_Product_Importer {
 	/**
 	 * Import one row in price/inventory mode.
 	 *
-	 * @param array $row Row data.
+	 * @param array            $row     Row data.
+	 * @param WC_Product|false $product Matched product, if any.
 	 * @return void
 	 * @throws RuntimeException On invalid data.
 	 */
-	private static function import_price_stock_row( array $row ) {
-		$product = self::find_product( $row );
-
+	private static function import_price_stock_row( array $row, $product ) {
 		if ( ! $product ) {
 			throw new RuntimeException( __( 'Product not found. Price/inventory mode does not create new products.', 'wc-product-importer' ) );
 		}
@@ -465,12 +464,12 @@ final class WC_Single_File_Product_Importer {
 		$changed = false;
 
 		if ( self::has_value_or_clear( $row, 'regular_price' ) ) {
-			$product->set_regular_price( self::decimal_or_clear( $row['regular_price'] ) );
+			$product->set_regular_price( self::non_negative_decimal_or_clear( $row['regular_price'], 'regular_price' ) );
 			$changed = true;
 		}
 
 		if ( self::has_value_or_clear( $row, 'sale_price' ) ) {
-			$product->set_sale_price( self::decimal_or_clear( $row['sale_price'] ) );
+			$product->set_sale_price( self::non_negative_decimal_or_clear( $row['sale_price'], 'sale_price' ) );
 			$changed = true;
 		}
 
@@ -511,12 +510,12 @@ final class WC_Single_File_Product_Importer {
 	/**
 	 * Import one row in full mode.
 	 *
-	 * @param array $row Row data.
+	 * @param array            $row     Row data.
+	 * @param WC_Product|false $product Matched product, if any.
 	 * @return void
 	 * @throws RuntimeException On invalid data.
 	 */
-	private static function import_full_row( array $row ) {
-		$product = self::find_product( $row );
+	private static function import_full_row( array $row, $product ) {
 		$is_new  = ! $product;
 		$type    = self::has_value( $row, 'type' ) ? sanitize_key( $row['type'] ) : 'simple';
 
@@ -571,6 +570,10 @@ final class WC_Single_File_Product_Importer {
 		$product_by_id  = $id > 0 ? wc_get_product( $id ) : false;
 		$product_by_sku = false;
 
+		if ( $id > 0 && ! $product_by_id ) {
+			throw new RuntimeException( __( 'The supplied product ID does not identify an existing WooCommerce product.', 'wc-product-importer' ) );
+		}
+
 		if ( '' !== $sku ) {
 			$sku_id = wc_get_product_id_by_sku( $sku );
 
@@ -588,6 +591,49 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		return $product_by_id ? $product_by_id : $product_by_sku;
+	}
+
+	/**
+	 * Build stable identity keys for duplicate detection.
+	 *
+	 * Including identifiers already stored on a matched product prevents the same
+	 * product from appearing once by ID and again by SKU in a single import.
+	 *
+	 * @param array            $row     Row data.
+	 * @param WC_Product|false $product Matched product, if any.
+	 * @return array
+	 * @throws RuntimeException If the row has no usable identifier.
+	 */
+	private static function identity_keys_for_row( array $row, $product ) {
+		$id   = self::get_int( $row, 'id' );
+		$sku  = self::get_string( $row, 'sku' );
+		$keys = array();
+
+		if ( $id > 0 ) {
+			$keys[] = 'id:' . $id;
+		}
+
+		if ( '' !== $sku ) {
+			$keys[] = 'sku:' . strtolower( $sku );
+		}
+
+		if ( $product ) {
+			$keys[] = 'id:' . (int) $product->get_id();
+			$stored_sku = (string) $product->get_sku();
+
+			if ( '' !== $stored_sku ) {
+				$keys[] = 'sku:' . strtolower( $stored_sku );
+			}
+		}
+
+		$keys = array_values( array_unique( $keys ) );
+		sort( $keys, SORT_STRING );
+
+		if ( empty( $keys ) ) {
+			throw new RuntimeException( __( 'This row does not contain a valid product ID or SKU.', 'wc-product-importer' ) );
+		}
+
+		return $keys;
 	}
 
 	/**
@@ -686,19 +732,36 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		if ( self::has_value_or_clear( $row, 'regular_price' ) && method_exists( $product, 'set_regular_price' ) ) {
-			$product->set_regular_price( self::decimal_or_clear( $row['regular_price'] ) );
+			$product->set_regular_price( self::non_negative_decimal_or_clear( $row['regular_price'], 'regular_price' ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'sale_price' ) && method_exists( $product, 'set_sale_price' ) ) {
-			$product->set_sale_price( self::decimal_or_clear( $row['sale_price'] ) );
+			$product->set_sale_price( self::non_negative_decimal_or_clear( $row['sale_price'], 'sale_price' ) );
 		}
 
-		if ( self::has_value_or_clear( $row, 'sale_start' ) && method_exists( $product, 'set_date_on_sale_from' ) ) {
-			$product->set_date_on_sale_from( self::date_or_clear( $row['sale_start'] ) );
-		}
+		if ( method_exists( $product, 'set_date_on_sale_from' ) && method_exists( $product, 'set_date_on_sale_to' ) ) {
+			$sale_start = method_exists( $product, 'get_date_on_sale_from' ) ? $product->get_date_on_sale_from( 'edit' ) : null;
+			$sale_end   = method_exists( $product, 'get_date_on_sale_to' ) ? $product->get_date_on_sale_to( 'edit' ) : null;
 
-		if ( self::has_value_or_clear( $row, 'sale_end' ) && method_exists( $product, 'set_date_on_sale_to' ) ) {
-			$product->set_date_on_sale_to( self::date_or_clear( $row['sale_end'] ) );
+			if ( self::has_value_or_clear( $row, 'sale_start' ) ) {
+				$sale_start = self::date_or_clear( $row['sale_start'] );
+			}
+
+			if ( self::has_value_or_clear( $row, 'sale_end' ) ) {
+				$sale_end = self::date_or_clear( $row['sale_end'] );
+			}
+
+			if ( $sale_start && $sale_end && $sale_start->getTimestamp() > $sale_end->getTimestamp() ) {
+				throw new RuntimeException( __( 'sale_end must be later than or equal to sale_start.', 'wc-product-importer' ) );
+			}
+
+			if ( self::has_value_or_clear( $row, 'sale_start' ) ) {
+				$product->set_date_on_sale_from( $sale_start );
+			}
+
+			if ( self::has_value_or_clear( $row, 'sale_end' ) ) {
+				$product->set_date_on_sale_to( $sale_end );
+			}
 		}
 
 		if ( self::has_value( $row, 'tax_status' ) ) {
@@ -736,19 +799,19 @@ final class WC_Single_File_Product_Importer {
 		}
 
 		if ( self::has_value_or_clear( $row, 'weight' ) ) {
-			$product->set_weight( self::decimal_or_clear( $row['weight'] ) );
+			$product->set_weight( self::non_negative_decimal_or_clear( $row['weight'], 'weight' ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'length' ) ) {
-			$product->set_length( self::decimal_or_clear( $row['length'] ) );
+			$product->set_length( self::non_negative_decimal_or_clear( $row['length'], 'length' ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'width' ) ) {
-			$product->set_width( self::decimal_or_clear( $row['width'] ) );
+			$product->set_width( self::non_negative_decimal_or_clear( $row['width'], 'width' ) );
 		}
 
 		if ( self::has_value_or_clear( $row, 'height' ) ) {
-			$product->set_height( self::decimal_or_clear( $row['height'] ) );
+			$product->set_height( self::non_negative_decimal_or_clear( $row['height'], 'height' ) );
 		}
 
 		if ( self::has_value( $row, 'virtual' ) ) {
@@ -973,11 +1036,7 @@ final class WC_Single_File_Product_Importer {
 			)
 		);
 
-		if ( is_wp_error( $created ) ) {
-			throw new RuntimeException( $created->get_error_message() );
-		}
-
-		return (int) $created['term_id'];
+		return self::inserted_term_id_or_throw( $created );
 	}
 
 	/**
@@ -991,7 +1050,12 @@ final class WC_Single_File_Product_Importer {
 		$ids = array();
 
 		foreach ( self::split_pipe( $value ) as $category_path ) {
-			$segments  = array_filter( array_map( 'trim', explode( '>', $category_path ) ), 'strlen' );
+			$segments = array_map( 'trim', explode( '>', $category_path ) );
+
+			if ( in_array( '', $segments, true ) ) {
+				throw new RuntimeException( __( 'Each category path must contain a name on both sides of every ">" separator.', 'wc-product-importer' ) );
+			}
+
 			$parent_id = 0;
 
 			foreach ( $segments as $segment ) {
@@ -1008,11 +1072,7 @@ final class WC_Single_File_Product_Importer {
 						)
 					);
 
-					if ( is_wp_error( $created ) ) {
-						throw new RuntimeException( $created->get_error_message() );
-					}
-
-					$term_id = (int) $created['term_id'];
+					$term_id = self::inserted_term_id_or_throw( $created );
 				}
 
 				$parent_id = $term_id;
@@ -1046,14 +1106,34 @@ final class WC_Single_File_Product_Importer {
 
 			$created = wp_insert_term( $tag, 'product_tag' );
 
-			if ( is_wp_error( $created ) ) {
-				throw new RuntimeException( $created->get_error_message() );
-			}
-
-			$ids[] = (int) $created['term_id'];
+			$ids[] = self::inserted_term_id_or_throw( $created );
 		}
 
 		return array_values( array_unique( $ids ) );
+	}
+
+	/**
+	 * Return a newly inserted term ID, including a concurrent existing term.
+	 *
+	 * @param array|WP_Error $created Result from wp_insert_term().
+	 * @return int
+	 * @throws RuntimeException On term creation errors.
+	 */
+	private static function inserted_term_id_or_throw( $created ) {
+		if ( ! is_wp_error( $created ) ) {
+			return (int) $created['term_id'];
+		}
+
+		if ( 'term_exists' === $created->get_error_code() ) {
+			$existing = $created->get_error_data( 'term_exists' );
+			$term_id  = is_array( $existing ) && isset( $existing['term_id'] ) ? (int) $existing['term_id'] : (int) $existing;
+
+			if ( $term_id > 0 ) {
+				return $term_id;
+			}
+		}
+
+		throw new RuntimeException( $created->get_error_message() );
 	}
 
 	/**
@@ -1337,7 +1417,7 @@ final class WC_Single_File_Product_Importer {
 		require_once ABSPATH . 'wp-admin/includes/media.php';
 		require_once ABSPATH . 'wp-admin/includes/image.php';
 
-		$attachment_id = media_sideload_image( $url, $product_id, null, 'id' );
+		$attachment_id = self::sideload_remote_image( $url, $product_id );
 
 		if ( is_wp_error( $attachment_id ) ) {
 			throw new RuntimeException( $attachment_id->get_error_message() );
@@ -1347,6 +1427,117 @@ final class WC_Single_File_Product_Importer {
 		self::$resolved_image_ids[ $value ] = (int) $attachment_id;
 
 		return self::$resolved_image_ids[ $value ];
+	}
+
+	/**
+	 * Download and sideload an image with explicit network and size limits.
+	 *
+	 * wp_safe_remote_get() validates the initial URL and every redirect. Streaming
+	 * to a temporary file avoids holding remote content in PHP memory.
+	 *
+	 * @param string $url        Remote image URL.
+	 * @param int    $product_id Product ID.
+	 * @return int|WP_Error
+	 */
+	private static function sideload_remote_image( $url, $product_id ) {
+		$url_path = (string) wp_parse_url( $url, PHP_URL_PATH );
+		$filename = sanitize_file_name( wp_basename( rawurldecode( $url_path ) ) );
+
+		if ( '' === $filename || '' === pathinfo( $filename, PATHINFO_EXTENSION ) ) {
+			return new WP_Error( 'wc_sfpi_image_filename', __( 'The remote image URL must end with an image filename and extension.', 'wc-product-importer' ) );
+		}
+
+		$tmp_name = wp_tempnam( $filename );
+
+		if ( ! $tmp_name ) {
+			return new WP_Error( 'wc_sfpi_image_temp_file', __( 'A temporary file could not be created for the remote image.', 'wc-product-importer' ) );
+		}
+
+		$response = wp_safe_remote_get(
+			$url,
+			array(
+				'timeout'             => self::REMOTE_IMAGE_TIMEOUT,
+				'redirection'         => self::REMOTE_IMAGE_REDIRECTS,
+				'stream'              => true,
+				'filename'            => $tmp_name,
+				'limit_response_size' => self::MAX_REMOTE_IMAGE_SIZE + 1,
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			self::delete_temp_file( $tmp_name );
+			return $response;
+		}
+
+		if ( 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+			self::delete_temp_file( $tmp_name );
+			return new WP_Error( 'wc_sfpi_image_http_status', __( 'The remote image server returned an unsuccessful response.', 'wc-product-importer' ) );
+		}
+
+		$content_length = wp_remote_retrieve_header( $response, 'content-length' );
+
+		if ( is_numeric( $content_length ) && (float) $content_length > self::MAX_REMOTE_IMAGE_SIZE ) {
+			self::delete_temp_file( $tmp_name );
+			return new WP_Error( 'wc_sfpi_image_too_large', __( 'The remote image exceeds the 10 MB size limit.', 'wc-product-importer' ) );
+		}
+
+		$file_size = file_exists( $tmp_name ) ? filesize( $tmp_name ) : false;
+
+		if ( false === $file_size || $file_size <= 0 ) {
+			self::delete_temp_file( $tmp_name );
+			return new WP_Error( 'wc_sfpi_image_empty', __( 'The remote image download was empty.', 'wc-product-importer' ) );
+		}
+
+		if ( $file_size > self::MAX_REMOTE_IMAGE_SIZE ) {
+			self::delete_temp_file( $tmp_name );
+			return new WP_Error( 'wc_sfpi_image_too_large', __( 'The remote image exceeds the 10 MB size limit.', 'wc-product-importer' ) );
+		}
+
+		$actual_mime = wp_get_image_mime( $tmp_name );
+		$filetype    = wp_check_filetype_and_ext( $tmp_name, $filename );
+
+		if (
+			! $actual_mime ||
+			0 !== strpos( $actual_mime, 'image/' ) ||
+			empty( $filetype['ext'] ) ||
+			empty( $filetype['type'] ) ||
+			0 !== strpos( $filetype['type'], 'image/' )
+		) {
+			self::delete_temp_file( $tmp_name );
+			return new WP_Error( 'wc_sfpi_image_type', __( 'The downloaded file is not a permitted image type.', 'wc-product-importer' ) );
+		}
+
+		if ( ! empty( $filetype['proper_filename'] ) ) {
+			$filename = sanitize_file_name( $filetype['proper_filename'] );
+		}
+
+		$attachment_id = media_handle_sideload(
+			array(
+				'name'     => $filename,
+				'tmp_name' => $tmp_name,
+				'error'    => 0,
+				'size'     => $file_size,
+			),
+			$product_id
+		);
+
+		if ( is_wp_error( $attachment_id ) ) {
+			self::delete_temp_file( $tmp_name );
+		}
+
+		return $attachment_id;
+	}
+
+	/**
+	 * Delete a temporary file if it still exists.
+	 *
+	 * @param string $path Temporary file path.
+	 * @return void
+	 */
+	private static function delete_temp_file( $path ) {
+		if ( $path && file_exists( $path ) ) {
+			wp_delete_file( $path );
+		}
 	}
 
 	/**
@@ -1393,7 +1584,8 @@ final class WC_Single_File_Product_Importer {
 			$delimiter = self::detect_csv_delimiter( $first_line );
 			rewind( $handle );
 
-			$rows = array();
+			$rows       = array();
+			$cell_count = 0;
 
 			while ( false !== ( $row = fgetcsv( $handle, 0, $delimiter, '"', '' ) ) ) {
 				if ( count( $row ) > self::MAX_COLUMNS ) {
@@ -1410,6 +1602,20 @@ final class WC_Single_File_Product_Importer {
 					if ( is_string( $value ) && false !== strpos( $value, "\0" ) ) {
 						throw new RuntimeException( __( 'The CSV file contains binary data and cannot be imported.', 'wc-product-importer' ) );
 					}
+
+					self::validate_cell_value( $value, 'CSV' );
+				}
+
+				$cell_count += count( $row );
+
+				if ( $cell_count > self::MAX_IMPORT_CELLS ) {
+					throw new RuntimeException(
+						sprintf(
+							/* translators: %d: maximum number of cells. */
+							__( 'The CSV contains more than the allowed %d total cells.', 'wc-product-importer' ),
+							self::MAX_IMPORT_CELLS
+						)
+					);
 				}
 
 				if ( ! empty( $row[0] ) && 0 === strpos( $row[0], "\xEF\xBB\xBF" ) ) {
@@ -1539,8 +1745,9 @@ final class WC_Single_File_Product_Importer {
 			}
 
 			$xml->registerXPathNamespace( 'main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main' );
-			$row_nodes = $xml->xpath( '//main:sheetData/main:row' );
-			$rows      = array();
+			$row_nodes  = $xml->xpath( '//main:sheetData/main:row' );
+			$rows       = array();
+			$cell_count = 0;
 
 			if ( empty( $row_nodes ) ) {
 				return $rows;
@@ -1569,6 +1776,10 @@ final class WC_Single_File_Product_Importer {
 						);
 					}
 
+					if ( array_key_exists( $column_index, $row ) ) {
+						throw new RuntimeException( __( 'The Excel worksheet contains duplicate cell references in a row.', 'wc-product-importer' ) );
+					}
+
 					$type         = isset( $attributes['t'] ) ? (string) $attributes['t'] : 'n';
 					$value        = '';
 
@@ -1580,14 +1791,34 @@ final class WC_Single_File_Product_Importer {
 						$raw = (string) $cell_children->v;
 
 						if ( 's' === $type ) {
+							if ( 1 !== preg_match( '/^\d+$/D', $raw ) || ! array_key_exists( (int) $raw, $shared_strings ) ) {
+								throw new RuntimeException( __( 'The Excel worksheet contains an invalid shared-string reference.', 'wc-product-importer' ) );
+							}
+
 							$shared_index = (int) $raw;
-							$value        = isset( $shared_strings[ $shared_index ] ) ? $shared_strings[ $shared_index ] : '';
+							$value        = $shared_strings[ $shared_index ];
 						} elseif ( 'b' === $type ) {
-							$value = '1' === $raw ? '1' : '0';
-						} else {
+							if ( ! in_array( $raw, array( '0', '1' ), true ) ) {
+								throw new RuntimeException( __( 'The Excel worksheet contains an invalid boolean cell.', 'wc-product-importer' ) );
+							}
+
 							$value = $raw;
+						} elseif ( 'n' === $type ) {
+							if ( '' !== $raw && ! is_numeric( $raw ) ) {
+								throw new RuntimeException( __( 'The Excel worksheet contains an invalid numeric cell.', 'wc-product-importer' ) );
+							}
+
+							$value = $raw;
+						} elseif ( 'str' === $type ) {
+							$value = $raw;
+						} else {
+							throw new RuntimeException( __( 'The Excel worksheet contains an unsupported cell type.', 'wc-product-importer' ) );
 						}
+					} elseif ( ! in_array( $type, array( 'n', 'str' ), true ) ) {
+						throw new RuntimeException( __( 'The Excel worksheet contains an unsupported empty cell type.', 'wc-product-importer' ) );
 					}
+
+					self::validate_cell_value( $value, 'Excel' );
 
 					$row[ $column_index ] = trim( (string) $value );
 				}
@@ -1600,6 +1831,18 @@ final class WC_Single_File_Product_Importer {
 
 					for ( $i = 0; $i <= $max_index; $i++ ) {
 						$normalized[] = isset( $row[ $i ] ) ? $row[ $i ] : '';
+					}
+
+					$cell_count += $max_index + 1;
+
+					if ( $cell_count > self::MAX_IMPORT_CELLS ) {
+						throw new RuntimeException(
+							sprintf(
+								/* translators: %d: maximum number of cells. */
+								__( 'The Excel worksheet contains more than the allowed %d total cells.', 'wc-product-importer' ),
+								self::MAX_IMPORT_CELLS
+							)
+						);
 					}
 
 					$rows[] = $normalized;
@@ -2280,6 +2523,30 @@ final class WC_Single_File_Product_Importer {
 	}
 
 	/**
+	 * Format a non-negative decimal or return empty for the clear token.
+	 *
+	 * @param mixed  $value Value.
+	 * @param string $field Field name for errors.
+	 * @return string
+	 * @throws RuntimeException On negative or non-finite values.
+	 */
+	private static function non_negative_decimal_or_clear( $value, $field ) {
+		$normalized = self::decimal_or_clear( $value );
+
+		if ( '' !== $normalized && ( ! is_finite( (float) $normalized ) || (float) $normalized < 0 ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: field name. */
+					__( '%s must be a non-negative numeric value.', 'wc-product-importer' ),
+					$field
+				)
+			);
+		}
+
+		return $normalized;
+	}
+
+	/**
 	 * Parse a stock quantity safely.
 	 *
 	 * @param mixed $value Raw stock value.
@@ -2407,7 +2674,48 @@ final class WC_Single_File_Product_Importer {
 	 * @return array
 	 */
 	private static function split_pipe( $value ) {
-		return array_values( array_filter( array_map( 'trim', explode( '|', $value ) ), 'strlen' ) );
+		$parts = array_map( 'trim', explode( '|', $value ) );
+
+		if ( in_array( '', $parts, true ) ) {
+			throw new RuntimeException( __( 'Pipe-separated values cannot contain empty items.', 'wc-product-importer' ) );
+		}
+
+		return array_values( $parts );
+	}
+
+	/**
+	 * Validate a parsed spreadsheet cell before retaining it in memory.
+	 *
+	 * @param mixed  $value  Cell value.
+	 * @param string $format Human-readable input format.
+	 * @return void
+	 * @throws RuntimeException On invalid UTF-8 or an oversized cell.
+	 */
+	private static function validate_cell_value( $value, $format ) {
+		if ( ! is_string( $value ) ) {
+			return;
+		}
+
+		if ( strlen( $value ) > self::MAX_CELL_SIZE ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: 1: file format, 2: size in bytes. */
+					__( 'A %1$s cell exceeds the allowed %2$d-byte size.', 'wc-product-importer' ),
+					$format,
+					self::MAX_CELL_SIZE
+				)
+			);
+		}
+
+		if ( 1 !== preg_match( '//u', $value ) ) {
+			throw new RuntimeException(
+				sprintf(
+					/* translators: %s: file format. */
+					__( 'The %s file contains text that is not valid UTF-8.', 'wc-product-importer' ),
+					$format
+				)
+			);
+		}
 	}
 
 	/**
